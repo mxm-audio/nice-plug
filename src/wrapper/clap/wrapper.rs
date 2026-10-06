@@ -41,8 +41,10 @@ use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, CLAP_RENDER_REALTIME, clap_plugin_render,
     clap_plugin_render_mode,
 };
+#[cfg(feature = "editor")]
+use clap_sys::ext::state::clap_host_state;
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
-use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_plugin_tail};
+use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail, clap_plugin_tail};
 use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
 use clap_sys::ext::track_info::CLAP_EXT_TRACK_INFO;
 #[cfg(feature = "editor")]
@@ -64,7 +66,6 @@ use clap_sys::process::{
 };
 use clap_sys::stream::{clap_istream, clap_ostream};
 use crossbeam::atomic::AtomicCell;
-use crossbeam::channel::{self, SendTimeoutError};
 use crossbeam::queue::ArrayQueue;
 use nice_plug_core::audio_setup::{AudioIOLayout, AuxiliaryBuffers, BufferConfig, ProcessMode};
 #[cfg(feature = "editor")]
@@ -107,9 +108,41 @@ use crate::wrapper::state::{self};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{clamp_input_event_timing, hash_param_id, process_wrapper, strlcpy};
 
-/// How many output parameter changes we can store in our output parameter change queue. Storing
-/// more than this many parameters at a time will cause changes to get lost.
-const OUTPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
+/// The baseline capacity for GUI-authored output parameter events.
+const MIN_OUTPUT_PARAMETER_EVENT_CAPACITY: usize = 2048;
+
+/// MXM PATCH (defect 1): a complete GUI-authored patch emits begin/value/end for every exposed
+/// parameter. Reserve that inventory beside the original live-edit budget or a large plugin drops
+/// the suffix of its preset before `process()` or `params.flush()` can apply it.
+fn output_parameter_event_capacity(parameter_count: usize) -> usize {
+    parameter_count
+        .saturating_mul(3)
+        .saturating_add(MIN_OUTPUT_PARAMETER_EVENT_CAPACITY)
+        .min(MAX_EVENT_CAPACITY)
+}
+
+#[inline]
+fn has_infinite_tail(status: ProcessStatus) -> bool {
+    matches!(status, ProcessStatus::KeepAlive)
+}
+
+/// Publish first so a host that immediately re-queries `clap_plugin_tail` from `changed()` sees the
+/// new finite/infinite class. CLAP permits the callback on the audio thread; this path performs one
+/// atomic swap, one atomic callback load at the call site, and no locking or allocation.
+#[inline]
+fn publish_process_status(
+    last: &AtomicCell<ProcessStatus>,
+    status: ProcessStatus,
+    host: &clap_host,
+    tail_changed: Option<unsafe extern "C" fn(host: *const clap_host)>,
+) {
+    let previous = last.swap(status);
+    if has_infinite_tail(previous) != has_infinite_tail(status)
+        && let Some(changed) = tail_changed
+    {
+        unsafe { changed(host) };
+    }
+}
 
 /// Protect against OOM issues when loading malformed state.
 ///
@@ -140,6 +173,15 @@ pub struct Wrapper<P: ClapPlugin> {
     #[allow(clippy::type_complexity)]
     editor_window:
         AtomicRefCell<Option<fragile::Fragile<SpawnedEditor<<P::Editor as Editor>::Handle>>>>,
+    /// MXM PATCH: whether the active editor was created as a floating window.
+    ///
+    /// The creation mode has to survive from `clap.gui.create` to `clap.gui.set_parent`, because
+    /// those are separate host calls and `SpawnedEditor` carries no record of it. Both alternatives
+    /// are wrong: reparenting a window that was created floating **panics** inside baseview -- see
+    /// its `Window::set_parent` docs -- and refusing every reparent would break embedded hosting in
+    /// every DAW that uses it today.
+    #[cfg(feature = "editor")]
+    editor_is_floating: AtomicBool,
     /// The DPI scaling factor as passed to the [IPlugViewContentScaleSupport::set_scale_factor()]
     /// function. Defaults to 1.0, and will be kept there on macOS. When reporting and handling size
     /// the sizes communicated to and from the DAW should be scaled by this factor since nice-plug's
@@ -157,13 +199,25 @@ pub struct Wrapper<P: ClapPlugin> {
     /// The current audio processing mode. Set through the render extension. Defaults to realtime.
     pub current_process_mode: AtomicCell<ProcessMode>,
     /// The incoming events for the plugin, if `P::MIDI_INPUT` is set to `MidiConfig::Basic` or
-    /// higher.
-    ///
-    /// TODO: Maybe load these lazily at some point instead of needing to spool them all to this
-    ///       queue first
+    /// higher. The backing allocation is made before processing. `event_queue_limit` bounds both
+    /// storage and each of the raw-event windows inspected in one callback; overflow drops newest
+    /// ordinary events while always admitting the newest termination.
     input_events: AtomicRefCell<VecDeque<PluginNoteEvent<P>>>,
+    // MXM PATCH (defect 1, refreshed onto 0.4.2): upstream 0.4 removed the wrapper's output
+    // event queue -- `ProcessContext::try_send_event()` now pushes straight into the host's
+    // `out_events` and reports a full host buffer to the plugin -- so only input storage remains
+    // ours to bound.
+    /// MXM PATCH (defect 1): configured in `activate`, never exceeded in `process`.
+    event_queue_limit: AtomicCell<usize>,
+    dropped_input_events: AtomicU32,
+    /// MXM PATCH (defect 8, refreshed onto 0.4.2): set while `set_state_inner()` waits for or holds
+    /// the plugin lock, so `process()` can tell that deliberate exclusion from a misbehaving host.
+    state_transaction_active: AtomicBool,
     /// The last process status returned by the plugin. This is used for tail handling.
     last_process_status: AtomicCell<ProcessStatus>,
+    /// MXM PATCH (defect 10): cached host-tail callback. The audio thread reads only this atomic
+    /// function pointer; extension discovery and pointer chasing stay on initialization.
+    host_tail_changed: AtomicCell<Option<unsafe extern "C" fn(host: *const clap_host)>>,
     /// Whether the latency has changed since the last call to `activate`. When this is set,
     /// `latency_changed` needs to be called in `activate` in order to inform the host of the
     /// latency change.
@@ -175,18 +229,6 @@ pub struct Wrapper<P: ClapPlugin> {
     /// A data structure that helps manage and create buffers for all of the plugin's inputs and
     /// outputs based on channel pointers provided by the host.
     buffer_manager: AtomicRefCell<BufferManager>,
-    /// The plugin is able to restore state through a method on the `GuiContext`. To avoid changing
-    /// parameters mid-processing and running into garbled data if the host also tries to load state
-    /// at the same time the restoring happens at the end of each processing call. If this zero
-    /// capacity channel contains state data at that point, then the audio thread will take the
-    /// state out of the channel, restore the state, and then send it back through the same channel.
-    /// In other words, the GUI thread acts as a sender and then as a receiver, while the audio
-    /// thread acts as a receiver and then as a sender. That way deallocation can happen on the GUI
-    /// thread. All of this happens without any blocking on the audio thread.
-    updated_state_sender: channel::Sender<PluginState>,
-    /// The receiver belonging to [`new_state_sender`][Self::new_state_sender].
-    updated_state_receiver: channel::Receiver<PluginState>,
-
     // We'll query all of the host's extensions upfront
     host_callback: ClapPtr<clap_host>,
 
@@ -258,6 +300,8 @@ pub struct Wrapper<P: ClapPlugin> {
     clap_plugin_render: clap_plugin_render,
 
     clap_plugin_state: clap_plugin_state,
+    #[cfg(feature = "editor")]
+    host_state: AtomicRefCell<Option<ClapPtr<clap_host_state>>>,
 
     clap_plugin_tail: clap_plugin_tail,
 
@@ -314,6 +358,10 @@ pub enum Task<P: Plugin> {
     /// Inform the host that the voice info has changed.
     VoiceInfoChanged,
     /// Tell the host that it should rescan the current parameter values.
+    // MXM PATCH (defects 3 and 8, refreshed onto 0.4.2): upstream's only sender was the
+    // audio-thread GUI-state handoff that defect 8 removes, and defect 3's rescan now rides on
+    // `StateChanged`. The variant and its handler are kept as upstream wrote them.
+    #[allow(dead_code)]
     RescanParamValues,
 }
 
@@ -356,6 +404,13 @@ impl<P: ClapPlugin> EventLoop<Task<P>, Wrapper<P>> for Wrapper<P> {
     }
 
     fn schedule_gui(&self, task: Task<P>) -> bool {
+        // MXM PATCH (GUI-task process-wake capability): an explicitly scheduled plugin task may
+        // represent a transient editor action rather than a parameter edit. Wake a sleeping audio processor as well as
+        // arranging the main-thread task; request_callback alone never resumes process().
+        if matches!(&task, Task::PluginTask(_)) {
+            let host = &self.host_callback;
+            unsafe_clap_call! { host=>request_process(&**host) };
+        }
         if self.is_main_thread() {
             self.execute(task, true);
             true
@@ -483,6 +538,150 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
     }
 }
 
+/// MXM PATCH: event queue and inspection bounds. CLAP does not bound events by frames, so the frame
+/// multiplier is only a capacity policy. The wrapper inspects at most one queue-capacity window at
+/// each end of a hostile list: the prefix preserves initial state, the suffix preserves the newest
+/// automation and termination, and the middle is dropped in O(1). A split-point candidate may be
+/// fetched once more when processing resumes, so raw `get()` calls are at most four capacities.
+const MIN_EVENT_CAPACITY: usize = 512;
+const EVENTS_PER_FRAME: usize = 8;
+const MAX_EVENT_CAPACITY: usize = 65_536;
+
+/// MXM PATCH (defect 1): reserve one simultaneous value event for every exposed parameter in
+/// addition to the frame-scaled note/transport budget. A host is allowed to send a complete patch
+/// at one sample; dropping the middle of that ordinary-sized list makes process-time application
+/// disagree with `params.flush()` for plugins whose inventory exceeds the frame budget.
+fn event_capacity(max_frames_count: usize, parameter_count: usize) -> usize {
+    max_frames_count
+        .saturating_mul(EVENTS_PER_FRAME)
+        .saturating_add(parameter_count)
+        .clamp(MIN_EVENT_CAPACITY, MAX_EVENT_CAPACITY)
+}
+
+/// MXM PATCH (defect 1, refreshed onto 0.4.2): upstream 0.4 added `Plugin::INPUT_EVENT_CAPACITY`
+/// (default 1024) as the input queue's initial allocation and lets the queue grow past it under
+/// `permit_alloc`. A plugin that declares a larger capacity gets it here as a floor beside the
+/// policy above; the queue still never grows past the configured limit.
+fn input_event_capacity<P: Plugin>(max_frames_count: usize, parameter_count: usize) -> usize {
+    event_capacity(max_frames_count, parameter_count).max(P::INPUT_EVENT_CAPACITY)
+}
+
+/// The raw host-event indices admitted for inspection in this callback.
+///
+/// Ordinary-sized lists are contiguous. Above twice the configured queue capacity, only the first
+/// and last capacity-sized windows are visited. The iterator jumps over the host-controlled middle
+/// instead of traversing it.
+struct BoundedInputEventIndices {
+    next: u32,
+    prefix_end: u32,
+    suffix_start: u32,
+    num_events: u32,
+}
+
+impl BoundedInputEventIndices {
+    fn new(num_events: u32, event_queue_limit: usize, resume_from: u32) -> Self {
+        let window = u32::try_from(event_queue_limit).unwrap_or(u32::MAX);
+        let overloaded = num_events > window.saturating_mul(2);
+        Self {
+            next: resume_from.min(num_events),
+            prefix_end: if overloaded {
+                window.min(num_events)
+            } else {
+                num_events
+            },
+            suffix_start: if overloaded {
+                num_events.saturating_sub(window)
+            } else {
+                num_events
+            },
+            num_events,
+        }
+    }
+}
+
+impl Iterator for BoundedInputEventIndices {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.prefix_end && self.next < self.suffix_start {
+            self.next = self.suffix_start;
+        }
+        if self.next >= self.num_events {
+            return None;
+        }
+
+        let current = self.next;
+        self.next += 1;
+        Some(current)
+    }
+}
+
+fn skipped_input_event_count(num_events: u32, event_queue_limit: usize) -> u32 {
+    let inspected = u32::try_from(event_queue_limit.saturating_mul(2)).unwrap_or(u32::MAX);
+    num_events.saturating_sub(inspected)
+}
+
+/// MXM PATCH (defect 7): clamp once in absolute buffer coordinates, then derive the event's
+/// segment-relative timing without subtraction that can underflow. Split-point selection and event
+/// conversion must agree on this value or a hostile timestamp can extend a segment past the host's
+/// buffers before the later event conversion gets a chance to clamp it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputEventTiming {
+    absolute: usize,
+    relative: u32,
+}
+
+fn input_event_timing(
+    raw_time: u32,
+    current_sample_idx: usize,
+    total_buffer_len: usize,
+) -> InputEventTiming {
+    // `frames_count` is a u32 in CLAP. Keep this helper robust for its usize-facing internal API.
+    let total_buffer_len = u32::try_from(total_buffer_len).unwrap_or(u32::MAX);
+    // As in nice-plug's other event clamps, sample zero is valid for a zero-frame flush.
+    let absolute = raw_time.min(total_buffer_len.saturating_sub(1));
+    let current_sample_idx = u32::try_from(current_sample_idx).unwrap_or(u32::MAX);
+    InputEventTiming {
+        absolute: absolute as usize,
+        relative: absolute.saturating_sub(current_sample_idx),
+    }
+}
+
+// MXM PATCH (defect 2, refreshed onto 0.4.2): our `MAX_STATE_SIZE` (512 MiB) is superseded by
+// upstream's `MAX_STATE_BYTES` (256 MiB) above, which `ext_state_load` checks before its fallible
+// `try_reserve_exact`. What upstream does not do is kept here: it reads into the vector's whole
+// spare capacity and accepts a short stream by truncating to the bytes read.
+
+/// MXM PATCH (defect 2): distinguish reservation failure from a short state stream without ever
+/// invoking the infallible allocation path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateReadError {
+    Allocation,
+    Stream,
+}
+
+/// Read exactly the declared payload span. `Vec` may reserve more than requested, so passing its
+/// entire spare capacity to `read_stream()` could consume bytes belonging to the next stream item.
+/// A stream that ends before the declared length is refused rather than parsed as a prefix.
+fn read_declared_state(stream: &clap_istream, length: usize) -> Result<Vec<u8>, StateReadError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| StateReadError::Allocation)?;
+    // Since 0.4, `read_stream()` returns the number of bytes read and stops early at end of
+    // stream, so a complete read is exactly `Some(length)`.
+    if read_stream(stream, &mut buffer.spare_capacity_mut()[..length]) != Some(length) {
+        return Err(StateReadError::Stream);
+    }
+    // SAFETY: `read_stream()` returned `Some(length)` only after initializing every byte in the
+    // requested span, and that span is exactly `length` bytes long.
+    unsafe {
+        buffer.set_len(length);
+    }
+
+    Ok(buffer)
+}
+
 impl<P: ClapPlugin> Wrapper<P> {
     /// # Safety
     ///
@@ -490,10 +689,6 @@ impl<P: ClapPlugin> Wrapper<P> {
     pub unsafe fn new(host_callback: *const clap_host) -> Arc<Self> {
         let mut plugin = P::default();
         let task_executor = Mutex::new(plugin.task_executor());
-
-        // This is used to allow the plugin to restore preset data from its editor, see the comment
-        // on `Self::updated_state_sender`
-        let (updated_state_sender, updated_state_receiver) = channel::bounded(0);
 
         let plugin_descriptor: Box<PluginDescriptor> =
             Box::new(PluginDescriptor::for_plugin::<P>());
@@ -547,6 +742,9 @@ impl<P: ClapPlugin> Wrapper<P> {
                 ptr.poly_modulation_id().map(|id| (*hash, id))
             })
             .collect();
+        let parameter_count = param_id_hashes_ptrs_groups.len();
+        let initial_event_capacity = input_event_capacity::<P>(0, parameter_count);
+        let output_parameter_event_capacity = output_parameter_event_capacity(parameter_count);
 
         if cfg!(debug_assertions) {
             let param_map = params.param_map();
@@ -603,6 +801,9 @@ impl<P: ClapPlugin> Wrapper<P> {
             editor: AtomicRefCell::new(None),
             #[cfg(feature = "editor")]
             editor_window: AtomicRefCell::new(None),
+            // MXM PATCH: see `editor_is_floating`.
+            #[cfg(feature = "editor")]
+            editor_is_floating: AtomicBool::new(false),
             #[cfg(feature = "editor")]
             fallback_scale_factor: AtomicCell::new(None),
 
@@ -613,8 +814,17 @@ impl<P: ClapPlugin> Wrapper<P> {
             ),
             current_buffer_config: AtomicCell::new(None),
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
-            input_events: AtomicRefCell::new(VecDeque::with_capacity(P::INPUT_EVENT_CAPACITY)),
+            // MXM PATCH (defect 1): allocate the parameter inventory's budget now, because
+            // `params.flush()` is valid before activation, and add the frame budget in
+            // `activate()`. Guarded pushes bound storage; the prefix/suffix inspection windows
+            // separately bound raw host traversal, so no host event count can grow either memory
+            // or callback work. `P::INPUT_EVENT_CAPACITY` (new in 0.4) is honoured as a floor.
+            input_events: AtomicRefCell::new(VecDeque::with_capacity(initial_event_capacity)),
+            event_queue_limit: AtomicCell::new(initial_event_capacity),
+            dropped_input_events: AtomicU32::new(0),
+            state_transaction_active: AtomicBool::new(false),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
+            host_tail_changed: AtomicCell::new(None),
             latency_changed: AtomicBool::new(false),
             current_latency: AtomicU32::new(0),
             // This is initialized just before calling `Plugin::activate()` so that during the
@@ -623,9 +833,6 @@ impl<P: ClapPlugin> Wrapper<P> {
                 0,
                 AudioIOLayout::default(),
             )),
-            updated_state_sender,
-            updated_state_receiver,
-
             host_callback,
 
             clap_plugin: AtomicRefCell::new(clap_plugin {
@@ -707,7 +914,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             param_id_to_hash,
             param_ptr_to_hash,
             poly_mod_ids_by_hash,
-            output_parameter_events: ArrayQueue::new(OUTPUT_EVENT_QUEUE_CAPACITY),
+            output_parameter_events: ArrayQueue::new(output_parameter_event_capacity),
 
             host_thread_check: AtomicRefCell::new(None),
 
@@ -726,6 +933,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                 save: Some(Self::ext_state_save),
                 load: Some(Self::ext_state_load),
             },
+            #[cfg(feature = "editor")]
+            host_state: AtomicRefCell::new(None),
 
             clap_plugin_tail: clap_plugin_tail {
                 get: Some(Self::ext_tail_get),
@@ -969,6 +1178,46 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
+    fn is_release_event(event: &PluginNoteEvent<P>) -> bool {
+        match event {
+            NoteEvent::NoteOff { .. } | NoteEvent::Choke { .. } => true,
+            NoteEvent::MidiCC { cc, .. } => *cc == 120 || *cc == 123,
+            _ => false,
+        }
+    }
+
+    /// MXM PATCH (defect 1): input NoteOns at zero velocity are termination events too. Instrument
+    /// event handlers follow the MIDI convention and interpret them as NoteOff, so dropping one as
+    /// ordinary overflow could leave a note admitted in an earlier callback held indefinitely.
+    /// Keep the output classifier unchanged: this is specifically an input interpretation seam.
+    fn is_input_release_event(event: &PluginNoteEvent<P>) -> bool {
+        matches!(event, NoteEvent::NoteOn { velocity, .. } if *velocity <= 0.0)
+            || Self::is_release_event(event)
+    }
+
+    /// Push without ever growing the deque. Ordinary events beyond the configured bound are
+    /// dropped newest-first. A release instead replaces the oldest queued event in O(1), so the
+    /// newest termination request is always admitted without a queue-length scan or shift.
+    /// Overflow counts are diagnostic and deliberately use atomics rather than logging on the
+    /// audio thread.
+    fn push_input_event(
+        &self,
+        input_events: &mut AtomicRefMut<VecDeque<PluginNoteEvent<P>>>,
+        event: PluginNoteEvent<P>,
+    ) {
+        let limit = self.event_queue_limit.load();
+        if input_events.len() < limit {
+            input_events.push_back(event);
+            return;
+        }
+
+        self.dropped_input_events.fetch_add(1, Ordering::Relaxed);
+        if Self::is_input_release_event(&event) {
+            let _ = input_events.pop_front();
+            input_events.push_back(event);
+        }
+    }
+
     /// Handle all incoming events from an event queue. This will clear `self.input_events` first.
     ///
     /// # Safety
@@ -986,7 +1235,12 @@ impl<P: ClapPlugin> Wrapper<P> {
 
         unsafe {
             let num_events = clap_call! { in_=>size(in_) };
-            for event_idx in 0..num_events {
+            let limit = self.event_queue_limit.load();
+            self.dropped_input_events.fetch_add(
+                skipped_input_event_count(num_events, limit),
+                Ordering::Relaxed,
+            );
+            for event_idx in BoundedInputEventIndices::new(num_events, limit, 0) {
                 let event = clap_call! { in_=>get(in_, event_idx) };
                 self.handle_input_event(
                     event,
@@ -1033,7 +1287,25 @@ impl<P: ClapPlugin> Wrapper<P> {
             return None;
         }
 
-        for event_idx in (resume_from_event_idx as u32)..num_events {
+        let limit = self.event_queue_limit.load();
+        if resume_from_event_idx == 0 {
+            self.dropped_input_events.fetch_add(
+                skipped_input_event_count(num_events, limit),
+                Ordering::Relaxed,
+            );
+        }
+
+        // MXM PATCH (defects 1 and 7): inspect only the bounded prefix/suffix candidate set. Since
+        // 0.4, upstream checks every selected event -- including the first -- before applying it
+        // (that was our defect 6); a parameter event after the current split point is returned
+        // untouched and the next segment resumes at that same raw index. Clamp its absolute
+        // timestamp before that comparison so an invalid host event cannot extend the segment
+        // beyond the audio buffers. The iterator jumps directly across an overloaded middle, so
+        // neither event traversal nor the number of split processing calls can follow the
+        // host-reported event count.
+        for event_idx in
+            BoundedInputEventIndices::new(num_events, limit, resume_from_event_idx as u32)
+        {
             unsafe {
                 let event: *const clap_event_header = clap_call! { in_=>get(in_, event_idx) };
                 if event.is_null() {
@@ -1042,8 +1314,15 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                 // Check the current event before applying it, including the first event in the
                 // buffer. A later event belongs to the next process slice.
-                if (*event).time > current_sample_idx as u32 && stop_predicate(event) {
-                    return Some(((*event).time as usize, event_idx as usize));
+                let raw_time = (*event).time;
+                let clamped_absolute = clamp_input_event_timing(
+                    raw_time,
+                    u32::try_from(total_buffer_len).unwrap_or(u32::MAX),
+                );
+                let timing = input_event_timing(raw_time, current_sample_idx, total_buffer_len);
+                crate::nice_debug_assert_eq!(timing.absolute, clamped_absolute as usize);
+                if timing.absolute > current_sample_idx && stop_predicate(event) {
+                    return Some((timing.absolute, event_idx as usize));
                 }
 
                 self.handle_input_event(
@@ -1167,25 +1446,25 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) {
         let raw_event = unsafe { &*event };
 
-        // Out of bounds events are clamped to the buffer's size
-        let timing = clamp_input_event_timing(
-            raw_event.time - current_sample_idx as u32,
-            total_buffer_len as u32,
+        // MXM PATCH (defect 7): clamp in absolute buffer coordinates first. Subtracting the current
+        // segment start from the raw host value could underflow for an invalid/non-monotonic event,
+        // and clamping only the result is too late to protect the split point used for audio slices.
+        let clamped_absolute = clamp_input_event_timing(
+            raw_event.time,
+            u32::try_from(total_buffer_len).unwrap_or(u32::MAX),
         );
+        let event_timing = input_event_timing(raw_event.time, current_sample_idx, total_buffer_len);
+        crate::nice_debug_assert_eq!(event_timing.absolute, clamped_absolute as usize);
+        let timing = event_timing.relative;
 
-        let push_event = |input_events: &mut AtomicRefMut<VecDeque<PluginNoteEvent<P>>>,
-                          event: PluginNoteEvent<P>| {
-            permit_alloc(|| {
-                // In the rare case the host sends a very large amount of events at once, there
-                // is not much we can do except to just accept the allocation.
-                if input_events.len() == input_events.capacity() {
-                    crate::nice_warn!(
-                        "Input event buffer filled up! This will cause an allocation."
-                    );
-                }
-                input_events.push_back(event);
-            });
-        };
+        // MXM PATCH (defect 1, refreshed onto 0.4.2): upstream 0.4 pushes past the reserved
+        // capacity under `permit_alloc`, accepting a heap allocation and a log line on the audio
+        // thread when a host sends more events than `P::INPUT_EVENT_CAPACITY`. Every push goes
+        // through the hard-bounded `push_input_event()` instead, which never grows the queue and
+        // always admits the newest termination.
+        let push_event =
+            |input_events: &mut AtomicRefMut<VecDeque<PluginNoteEvent<P>>>,
+             event: PluginNoteEvent<P>| { self.push_input_event(input_events, event) };
 
         fn voice_from_i32(v: i32) -> VoiceID {
             if v >= 0 {
@@ -1489,55 +1768,34 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
-    /// Update the plugin's internal state, called by the plugin itself from the GUI thread. To
-    /// prevent corrupting data and changing parameters during processing the actual state is only
-    /// updated at the end of the audio processing cycle.
+    /// Update the plugin's internal state from the GUI thread.
     pub fn set_state_object_from_gui(&self, mut state: PluginState) {
-        let mut did_set_state_inner = false;
+        // MXM PATCH (GUI-authored state dirty): a persistent model may already have published its
+        // complete prepared replacement off audio and need only tell the host that saved state is
+        // dirty. Such a transaction carries no parameters and fields byte-equal to the current
+        // fields. Do not take the plugin mutex or reactivate for that no-op: contending with
+        // `process()` makes parking_lot initialize its parking table on the allocation-forbidden
+        // audio thread, and a large model preparation can also block that thread for milliseconds.
+        // (Refreshed onto 0.4.2: the plugin lock is now upstream's non-blocking `TryLock`, so
+        // contention would instead make `process()` discard its blocks for the whole preparation.
+        // Skipping the transaction remains the point.)
+        let dirty_only = gui_state_is_dirty_only(&state, &self.params.serialize_fields());
 
-        // Use a loop and timeouts to handle the super rare edge case when this function gets called
-        // between a process call and the host disabling the plugin
-        loop {
-            if self.is_processing.load(Ordering::SeqCst) {
-                // If the plugin is currently processing audio, then we'll perform the restore
-                // operation at the end of the audio call. This involves sending the state to the
-                // audio thread, having the audio thread handle the state restore at the very end of
-                // the process function, and then sending the state back to this thread so it can be
-                // deallocated without blocking the audio thread.
-                match self
-                    .updated_state_sender
-                    .send_timeout(state, Duration::from_secs(1))
-                {
-                    Ok(_) => {
-                        // As mentioned above, the state object will be passed back to this thread
-                        // so we can deallocate it without blocking.
-                        let state = self.updated_state_receiver.recv();
-                        drop(state);
-                        break;
-                    }
-                    Err(SendTimeoutError::Timeout(value)) => {
-                        state = value;
-                        continue;
-                    }
-                    Err(SendTimeoutError::Disconnected(_)) => {
-                        crate::nice_debug_assert_failure!("State update channel got disconnected");
-                        return;
-                    }
-                }
-            } else {
-                // Otherwise we'll set the state right here and now, since this function should be
-                // called from a GUI thread
-                self.set_state_inner(&mut state);
-                did_set_state_inner = true;
-                break;
+        // MXM PATCH (defect 8): never run GUI asset deserialization/reactivation at the end of an
+        // audio callback. `set_state_inner()` now holds the plugin lock across the complete
+        // rollback-capable transaction, so this GUI thread waits for an in-flight callback and then
+        // performs every allocation off audio without exposing a half-applied parameter snapshot.
+        if dirty_only || self.set_state_inner(&mut state) {
+            // MXM PATCH (GUI-authored state dirty): non-parameter editor models are part of plugin
+            // state but do not emit parameter events. CLAP requires the state extension's
+            // `mark_dirty()` call so hosts know a drawn curve, imported asset, or other persistent
+            // field must be saved. Keep this at the GUI entry point: host-driven state restore must
+            // not mark itself dirty.
+            #[cfg(feature = "editor")]
+            if let Some(host_state) = &*self.host_state.borrow() {
+                unsafe_clap_call! { host_state=>mark_dirty(&*self.host_callback) };
             }
         }
-
-        if !did_set_state_inner {
-            // After the state has been updated, notify the host about the new parameter values
-            let task_posted = self.schedule_gui(Task::RescanParamValues);
-            crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
-        } // Else the RescanParamValues task has already been sent
     }
 
     pub fn set_latency_samples(&self, samples: u32) {
@@ -1643,31 +1901,115 @@ impl<P: ClapPlugin> Wrapper<P> {
     ///
     /// `self.plugin` must _not_ be locked while calling this function or it will deadlock.
     pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
-        // FIXME: This is obviously not realtime-safe, but loading presets without doing this
-        //        could lead to inconsistencies. `state::deserialize_object()` normally never
-        //        allocates, but if the plugin has persistent non-parameter data then its
-        //        `deserialize_fields()` implementation may still allocate.
-        let success = permit_alloc(|| unsafe {
+        let audio_io_layout = self.current_audio_io_layout.load();
+        let buffer_config = self.current_buffer_config.load();
+
+        // MXM PATCH (defect 8): serialize the working snapshot and hold the plugin lock across
+        // deserialize + reactivate. This both moves GUI state work off audio and makes activation
+        // failure atomic: parameters, persistent fields and the working engine are restored before
+        // the lock is released. The old wrapper mutated params/fields first and returned false with
+        // no rollback when an asset allocation failed in `activate()`.
+        //
+        // MXM PATCH (defect 8, refreshed onto 0.4.2): upstream 0.4 made the plugin lock a
+        // non-blocking `TryLock` and stopped reactivating the plugin after a state load at all (in
+        // both wrappers). The reactivation is kept: MXM plugins prepare persistent assets in
+        // `activate()`, and defects 8, 9 and 11 roll the whole load back when it fails. The lock is
+        // polled for off the audio thread, as upstream's own `activate()` does. While this
+        // transaction holds it, a concurrent `process()` discards its block with
+        // `CLAP_PROCESS_ERROR` instead of blocking on it the way the 0.3.0 mutex did; see
+        // `state_transaction_active`.
+        self.state_transaction_active.store(true, Ordering::SeqCst);
+        let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
+            self.state_transaction_active.store(false, Ordering::SeqCst);
+            crate::nice_error!("Failed to load state: could not acquire the plugin lock");
+            return false;
+        };
+        let mut previous = permit_alloc(|| unsafe {
+            state::serialize_object::<P>(
+                self.params.clone(),
+                state::make_params_iter(&self.param_by_hash, &self.param_id_to_hash),
+            )
+        });
+        let mut success = permit_alloc(|| unsafe {
             state::deserialize_object::<P>(
                 state,
                 self.params.clone(),
                 state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
-                self.current_buffer_config.load().as_ref(),
+                buffer_config.as_ref(),
             )
         });
-        if !success {
-            crate::nice_debug_assert_failure!(
-                "Deserializing plugin state from a state object failed"
-            );
-            return false;
+
+        // A `let` chain since the 0.4.2 refresh: on 0.3.0 this was two nested `if`s because that
+        // crate declared Rust 1.87 and chains are stable only from 1.88. 0.4.2 declares 1.88, and
+        // Clippy's `collapsible_if` now asks for the chain.
+        if success && let Some(buffer_config) = buffer_config {
+            let mut activate_context = self.make_activate_context();
+            success = permit_alloc(|| {
+                plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
+            });
+            if success {
+                process_wrapper(|| plugin.reset());
+            }
+            drop(activate_context);
         }
 
-        // Reinitialize the plugin after loading state so it can respond to the new parameter values,
-        // and tell the host to rescan the parameter values.
+        if !success {
+            let restored = permit_alloc(|| unsafe {
+                state::deserialize_object::<P>(
+                    &mut previous,
+                    self.params.clone(),
+                    state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
+                    buffer_config.as_ref(),
+                )
+            });
+            let mut reactivated = restored;
+            // A `let` chain since the 0.4.2 refresh, as above.
+            if restored && let Some(buffer_config) = buffer_config {
+                let mut activate_context = self.make_activate_context();
+                reactivated = permit_alloc(|| {
+                    plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
+                });
+                // A rejected state transaction must be observationally absent. Reactivation restores
+                // durable configuration, but resetting here would erase the working processor's
+                // response, delay, and tail histories even though the requested state did not load.
+                // A plugin's failed activation must leave its prior runtime state usable; the
+                // successful state-load arm above remains responsible for its normal reset contract.
+                drop(activate_context);
+            }
+            crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
+        }
+        drop(plugin);
+        self.state_transaction_active.store(false, Ordering::SeqCst);
+
+        crate::nice_debug_assert!(
+            success,
+            "Loading plugin state failed; restored previous state"
+        );
+
+        // MXM PATCH (defect 3, refreshed onto 0.4.2): our separate `Task::RescanParamValues` is
+        // gone because upstream's `Task::StateChanged` now also calls the host's
+        // `rescan(CLAP_PARAM_RESCAN_VALUES)` and is no longer editor-only. Upstream schedules it
+        // only after a successful deserialization; here it follows every completed transaction,
+        // including a rollback, because either way the host's cached values may be stale.
         let task_posted = self.schedule_gui(Task::StateChanged);
         crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
 
         success
+    }
+
+    /// MXM PATCH (defect 8, refreshed onto 0.4.2): wait for the plugin's `TryLock` off the audio
+    /// thread, the way upstream's own `activate()` does, giving up after one second.
+    fn lock_plugin_for_state_transaction(&self) -> Option<try_lock::Locked<'_, P>> {
+        let started = Instant::now();
+        loop {
+            if let Some(plugin) = self.plugin.try_lock() {
+                return Some(plugin);
+            }
+            if started.elapsed() > Duration::from_secs(1) {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     pub fn request_restart(&self) {
@@ -1695,8 +2037,17 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             *wrapper.host_latency.borrow_mut() =
                 query_host_extension::<clap_host_latency>(&wrapper.host_callback, CLAP_EXT_LATENCY);
+            wrapper.host_tail_changed.store(
+                query_host_extension::<clap_host_tail>(&wrapper.host_callback, CLAP_EXT_TAIL)
+                    .and_then(|extension| extension.changed),
+            );
             *wrapper.host_params.borrow_mut() =
                 query_host_extension::<clap_host_params>(&wrapper.host_callback, CLAP_EXT_PARAMS);
+            #[cfg(feature = "editor")]
+            {
+                *wrapper.host_state.borrow_mut() =
+                    query_host_extension::<clap_host_state>(&wrapper.host_callback, CLAP_EXT_STATE);
+            }
             *wrapper.host_voice_info.borrow_mut() = query_host_extension::<clap_host_voice_info>(
                 &wrapper.host_callback,
                 CLAP_EXT_VOICE_INFO,
@@ -1767,13 +2118,35 @@ impl<P: ClapPlugin> Wrapper<P> {
                     // method.
                     let now_2 = Instant::now();
                     loop {
-                        if let Ok(mut buffer_manager) = wrapper.buffer_manager.try_borrow_mut() {
+                        // MXM PATCH (defect 1): the input event queue is reserved below, so it
+                        // must be free of the process method as well.
+                        if let Ok(mut buffer_manager) = wrapper.buffer_manager.try_borrow_mut()
+                            && let Ok(mut input_events) = wrapper.input_events.try_borrow_mut()
+                        {
                             // This preallocates enough space so we can transform all of the host's raw channel
                             // pointers into a set of `Buffer` objects for the plugin's main and auxiliary IO
                             *buffer_manager = BufferManager::for_audio_io_layout(
                                 max_frames_count as usize,
                                 audio_io_layout,
                             );
+
+                            // MXM PATCH (defect 1): allocate event storage here, where allocation
+                            // is allowed. CLAP does not bound event count by frame count, so this
+                            // sizing is only policy. The same limit bounds storage and the raw-event
+                            // inspection windows; excess ordinary events are dropped, while a newest
+                            // termination replaces the oldest queued event in O(1). See
+                            // `BoundedInputEventIndices` for hostile host-list semantics. (Plugin
+                            // output no longer has a wrapper queue since 0.4.)
+                            {
+                                let event_capacity = input_event_capacity::<P>(
+                                    max_frames_count as usize,
+                                    wrapper.param_hashes.len(),
+                                );
+                                input_events.clear();
+                                input_events.reserve(event_capacity);
+                                wrapper.event_queue_limit.store(event_capacity);
+                                wrapper.dropped_input_events.store(0, Ordering::Relaxed);
+                            }
 
                             // Also store this for later, so we can reinitialize the plugin after restoring state
                             wrapper.current_buffer_config.store(Some(buffer_config));
@@ -1950,6 +2323,9 @@ impl<P: ClapPlugin> Wrapper<P> {
             // split the buffer.
             let mut transport_info = process.transport;
 
+            // MXM PATCH (defect 8): the audio-thread GUI-state restore that used to sit between
+            // this binding and its return is removed; upstream's binding is kept as written.
+            #[allow(clippy::let_and_return)]
             let result = loop {
                 if !process.in_events.is_null() {
                     let split_result = unsafe {
@@ -2220,6 +2596,14 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                 let result = if buffer_is_valid {
                     let Some(mut plugin) = wrapper.plugin.try_lock() else {
+                        // MXM PATCH (defect 8, refreshed onto 0.4.2): a GUI or host state load
+                        // holds this lock on purpose for its whole rollback-capable transaction.
+                        // That is not a misbehaving host, so discard the block without logging:
+                        // `nice_error!` is not allocation-permitted on this thread.
+                        if wrapper.state_transaction_active.load(Ordering::SeqCst) {
+                            return CLAP_PROCESS_ERROR;
+                        }
+
                         // On the occasion a host misbehaves and tries to activate/deactivate a plugin
                         // concurrently with the process method, return an error.
                         crate::nice_error!(
@@ -2247,7 +2631,12 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                     let result = plugin.process(buffers.main_buffer, &mut aux, &mut context);
 
-                    wrapper.last_process_status.store(result);
+                    publish_process_status(
+                        &wrapper.last_process_status,
+                        result,
+                        &wrapper.host_callback,
+                        wrapper.host_tail_changed.load(),
+                    );
                     result
                 } else {
                     ProcessStatus::Normal
@@ -2277,26 +2666,6 @@ impl<P: ClapPlugin> Wrapper<P> {
                     block_start = block_end;
                 }
             };
-
-            // After processing audio, we'll check if the editor has sent us updated plugin state.
-            // We'll restore that here on the audio thread to prevent changing the values during the
-            // process call and also to prevent inconsistent state when the host also wants to load
-            // plugin state.
-            // FIXME: Zero capacity channels allocate on receiving, find a better alternative that
-            //        doesn't do that
-            let updated_state = permit_alloc(|| wrapper.updated_state_receiver.try_recv());
-            if let Ok(mut state) = updated_state {
-                wrapper.set_state_inner(&mut state);
-
-                // We'll pass the state object back to the GUI thread so deallocation can happen
-                // there without potentially blocking the audio thread
-                if let Err(err) = wrapper.updated_state_sender.send(state) {
-                    crate::nice_debug_assert_failure!(
-                        "Failed to send state object back to GUI thread: {}",
-                        err
-                    );
-                };
-            }
 
             result
         })
@@ -2621,10 +2990,17 @@ impl<P: ClapPlugin> Wrapper<P> {
         api: *const c_char,
         is_floating: bool,
     ) -> bool {
-        // We don't do standalone floating windows
-        if is_floating {
-            return false;
-        }
+        // MXM PATCH: floating windows are supported.
+        //
+        // Upstream refuses every floating configuration. We need them because a host cannot always
+        // embed: Wayland has no cross-process embedding primitive at all, so CLAP's own
+        // `GuiApiType::WAYLAND` supports floating and forbids embedding. The window layer already
+        // handles it -- `Editor::spawn` takes `Option<ParentWindowHandle>` and this wrapper already
+        // passes `None`, waiting for a later `set_parent`. Floating simply stops waiting.
+        //
+        // The API check below is unchanged, so a floating request is accepted for exactly the
+        // platform APIs an embedded one is.
+        let _ = is_floating;
 
         unsafe {
             #[cfg(all(target_family = "unix", not(target_os = "macos")))]
@@ -2707,6 +3083,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                 struct ClapHostCallbacks<P: ClapPlugin> {
                     wrapper: Weak<Wrapper<P>>,
                     host_gui: ClapPtr<clap_host_gui>,
+                    // MXM PATCH: capture at creation, including callbacks during spawn.
+                    is_floating: bool,
                 }
 
                 impl<P: ClapPlugin> HostCallbacks for ClapHostCallbacks<P> {
@@ -2716,6 +3094,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                         scale_factor: f64,
                     ) -> Result<(), Box<dyn Error>> {
                         if let Some(wrapper) = self.wrapper.upgrade() {
+                            // MXM PATCH: CLAP request_resize asks for a *parent's* client area.
+                            // A floating window has none: baseview already resized it. Relaying
+                            // this wakes the host on every native drag event and can make it echo
+                            // sizes back or refuse the resize. Embedded editors still negotiate,
+                            // in upstream's `NativeSize` units (physical pixels on Windows and
+                            // Linux, logical points on macOS) since 0.4.
+                            if self.is_floating {
+                                return Ok(());
+                            }
                             use nice_plug_core::editor::dpi::NativeSize;
 
                             let native_size = NativeSize::from_size(new_size, scale_factor);
@@ -2751,6 +3138,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                 let callbacks: Box<dyn HostCallbacks> = Box::new(ClapHostCallbacks {
                     wrapper: wrapper.this.borrow().clone(),
                     host_gui: ClapPtr::clone(wrapper.host_gui.borrow().as_ref().unwrap()),
+                    // MXM PATCH: a floating editor owns its size, not the host.
+                    is_floating,
                 });
 
                 struct ClapHostMainThreadCaller<P: ClapPlugin> {
@@ -2772,9 +3161,13 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                 let fallback_scale_factor = wrapper.fallback_scale_factor.load();
 
+                // MXM PATCH: a floating window must not wait for a parent that will never
+                // arrive. `wait_for_parent` is what makes baseview defer creating the window until
+                // `set_parent`; for a floating editor there is no `set_parent`, so it is created
+                // here and `show` only reveals it.
                 match wrapper.editor.borrow().as_ref().unwrap().lock().spawn(
                     None,
-                    true,
+                    !is_floating,
                     fallback_scale_factor,
                     wrapper.clone().make_gui_context(),
                     Some(HostMethods {
@@ -2785,6 +3178,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                     Ok(editor_window) => {
                         *wrapper.editor_window.borrow_mut() =
                             Some(fragile::Fragile::new(editor_window));
+                        // MXM PATCH: remembered for `set_parent`, which must refuse afterwards.
+                        wrapper
+                            .editor_is_floating
+                            .store(is_floating, std::sync::atomic::Ordering::Relaxed);
                         true
                     }
                     Err(e) => {
@@ -2806,6 +3203,12 @@ impl<P: ClapPlugin> Wrapper<P> {
         result
     }
 
+    /// MXM PATCH: refuses when the editor was created as a floating window.
+    ///
+    /// baseview's `Window::set_parent` documents a panic for exactly this case -- a window created
+    /// with no parent and `wait_for_parent` false -- and that panic would be inside the host's
+    /// process. Returning `false` is the correct CLAP answer: the host asked for something this
+    /// configuration cannot do.
     #[cfg(feature = "editor")]
     unsafe extern "C" fn ext_gui_set_parent(
         plugin: *const clap_plugin,
@@ -2818,6 +3221,17 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data }, window);
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
         let window = unsafe { &*window };
+
+        // MXM PATCH: see this function's doc comment. Refusing here is what keeps the panic in
+        // baseview's `set_parent` unreachable.
+        if wrapper
+            .editor_is_floating
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            crate::nice_debug_assert_failure!("Host tried to reparent a floating editor window");
+
+            return false;
+        }
 
         if let Some(editor_window) = wrapper.editor_window.borrow().as_ref() {
             let editor_window = editor_window.get();
@@ -3454,21 +3868,27 @@ impl<P: ClapPlugin> Wrapper<P> {
             return false;
         }
 
-        let mut read_buffer: Vec<u8> = Vec::new();
-
-        if read_buffer.try_reserve_exact(length as usize).is_err() {
-            crate::nice_error!("Failed to load state: Failed to allocate buffer for state stream");
-            return false;
-        }
-
-        let bytes_read = read_stream(unsafe { &*stream }, read_buffer.spare_capacity_mut());
-        let Some(bytes_read) = bytes_read else {
-            crate::nice_error!("Failed to load state: Error while reading the state buffer");
-            return false;
+        // MXM PATCH (defect 2, refreshed onto 0.4.2): upstream's bound above and its fallible
+        // reservation replace ours. It then read into the vector's whole spare capacity and kept
+        // however many bytes arrived; `read_declared_state()` reads exactly the declared span, so
+        // neither a larger-than-requested reservation can consume the next stream item nor a
+        // truncated stream be parsed as a prefix. The bound makes `as usize` lossless on every
+        // CLAP target.
+        let read_buffer = match read_declared_state(unsafe { &*stream }, length as usize) {
+            Ok(buffer) => buffer,
+            Err(StateReadError::Allocation) => {
+                crate::nice_error!(
+                    "Failed to load state: Failed to allocate buffer for state stream"
+                );
+                return false;
+            }
+            Err(StateReadError::Stream) => {
+                crate::nice_error!(
+                    "Failed to load state: Error or end of stream while reading the state buffer"
+                );
+                return false;
+            }
         };
-        unsafe {
-            read_buffer.set_len(bytes_read);
-        }
 
         match unsafe { state::deserialize_json(&read_buffer) } {
             Some(mut state) => {
@@ -3530,6 +3950,16 @@ impl<P: ClapPlugin> Wrapper<P> {
     }
 }
 
+// MXM PATCH (GUI-authored state dirty): the explicit dirty-only transaction contains no parameter
+// writes and exactly the fields already installed by the plugin's control-side publisher. Comparing
+// the BTreeMaps also compares each field's canonical serialized representation.
+fn gui_state_is_dirty_only(
+    state: &PluginState,
+    current_fields: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    state.params.is_empty() && &state.fields == current_fields
+}
+
 /// Convenience function to query an extension from the host.
 ///
 /// # Safety
@@ -3546,5 +3976,308 @@ unsafe fn query_host_extension<T>(
         unsafe { Some(ClapPtr::new(extension_ptr as *const T)) }
     } else {
         None
+    }
+}
+
+// MXM PATCH: direct regressions for bounded hostile-event selection, out-of-range split timing,
+// allocation failure, declared-span reads, and host tail-change callbacks. Player integration
+// retains the real host paths; these reach exact wrapper cases its filesystem-backed stream cannot
+// force deterministically.
+// `assert_process_allocs` installs the crate's production allocation guard as the global allocator;
+// this module needs its own refusing allocator, so the focused command runs without that feature.
+#[cfg(all(test, not(feature = "assert_process_allocs")))]
+mod mxm_state_tests {
+    use super::*;
+    use clap_sys::version::CLAP_VERSION;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[test]
+    fn an_empty_parameter_transaction_with_current_fields_is_dirty_only() {
+        let fields =
+            std::collections::BTreeMap::from([("curve".to_owned(), "{\"schema\":1}".to_owned())]);
+        let mut state = PluginState {
+            version: "test".to_owned(),
+            params: Default::default(),
+            fields: fields.clone(),
+        };
+        assert!(gui_state_is_dirty_only(&state, &fields));
+
+        state.params.insert(
+            "mix".to_owned(),
+            nice_plug_core::plugin::ParamValue::F32(1.0),
+        );
+        assert!(!gui_state_is_dirty_only(&state, &fields));
+        state.params.clear();
+        state
+            .fields
+            .insert("curve".to_owned(), "different".to_owned());
+        assert!(!gui_state_is_dirty_only(&state, &fields));
+    }
+
+    const REFUSED_ALLOCATION_SIZE: usize = 256 * 1024 * 1024;
+    static REFUSE_LARGE_ALLOCATION: AtomicBool = AtomicBool::new(false);
+
+    struct RefusingAllocator;
+
+    // SAFETY: accepted operations are forwarded unchanged to `System`. Refused allocation and
+    // reallocation requests return null as `GlobalAlloc` permits, leaving any old allocation live.
+    unsafe impl GlobalAlloc for RefusingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if REFUSE_LARGE_ALLOCATION.load(Ordering::Relaxed)
+                && layout.size() >= REFUSED_ALLOCATION_SIZE
+            {
+                std::ptr::null_mut()
+            } else {
+                unsafe { System.alloc(layout) }
+            }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if REFUSE_LARGE_ALLOCATION.load(Ordering::Relaxed)
+                && layout.size() >= REFUSED_ALLOCATION_SIZE
+            {
+                std::ptr::null_mut()
+            } else {
+                unsafe { System.alloc_zeroed(layout) }
+            }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if REFUSE_LARGE_ALLOCATION.load(Ordering::Relaxed)
+                && new_size >= REFUSED_ALLOCATION_SIZE
+            {
+                std::ptr::null_mut()
+            } else {
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: RefusingAllocator = RefusingAllocator;
+
+    struct TestStream {
+        bytes: Vec<u8>,
+        position: usize,
+    }
+
+    unsafe extern "C" fn read_test_stream(
+        stream: *const clap_istream,
+        buffer: *mut c_void,
+        size: u64,
+    ) -> i64 {
+        let state = unsafe { &mut *((*stream).ctx as *mut TestStream) };
+        let count = state
+            .bytes
+            .len()
+            .saturating_sub(state.position)
+            .min(size as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                state.bytes.as_ptr().add(state.position),
+                buffer.cast::<u8>(),
+                count,
+            );
+        }
+        state.position += count;
+        count as i64
+    }
+
+    fn stream_for(state: &mut TestStream) -> clap_istream {
+        clap_istream {
+            ctx: (state as *mut TestStream).cast::<c_void>(),
+            read: Some(read_test_stream),
+        }
+    }
+
+    #[test]
+    fn parameter_inventory_is_reserved_beside_the_frame_event_budget() {
+        assert_eq!(event_capacity(256, 3_213), 5_261);
+        assert_eq!(event_capacity(0, 0), MIN_EVENT_CAPACITY);
+        assert_eq!(event_capacity(usize::MAX, usize::MAX), MAX_EVENT_CAPACITY);
+    }
+
+    #[test]
+    fn gui_output_queue_holds_one_complete_patch_beside_live_edits() {
+        assert_eq!(output_parameter_event_capacity(3_210), 11_678);
+        assert_eq!(
+            output_parameter_event_capacity(0),
+            MIN_OUTPUT_PARAMETER_EVENT_CAPACITY
+        );
+        assert_eq!(
+            output_parameter_event_capacity(usize::MAX),
+            MAX_EVENT_CAPACITY
+        );
+    }
+
+    #[test]
+    fn hostile_input_count_selects_only_two_bounded_windows() {
+        const HOST_EVENTS: u32 = 1_000_000;
+        const LIMIT: usize = 512;
+
+        let selected: Vec<_> = BoundedInputEventIndices::new(HOST_EVENTS, LIMIT, 0).collect();
+
+        assert_eq!(selected.len(), LIMIT * 2);
+        assert_eq!(selected[0], 0);
+        assert_eq!(selected[LIMIT - 1], LIMIT as u32 - 1);
+        assert_eq!(selected[LIMIT], HOST_EVENTS - LIMIT as u32);
+        assert_eq!(selected[LIMIT * 2 - 1], HOST_EVENTS - 1);
+        assert_eq!(
+            skipped_input_event_count(HOST_EVENTS, LIMIT),
+            HOST_EVENTS - (LIMIT * 2) as u32
+        );
+        assert_eq!(
+            BoundedInputEventIndices::new(HOST_EVENTS, LIMIT, LIMIT as u32).next(),
+            Some(HOST_EVENTS - LIMIT as u32),
+            "resuming at the dropped middle must jump directly to the suffix"
+        );
+    }
+
+    #[test]
+    fn out_of_range_split_event_is_clamped_before_buffer_partitioning() {
+        const FRAMES: usize = 64;
+        let first_segment = input_event_timing(1_024, 0, FRAMES);
+        assert_eq!(first_segment.absolute, FRAMES - 1);
+        assert_eq!(first_segment.relative, (FRAMES - 1) as u32);
+        assert!(
+            first_segment.absolute <= FRAMES,
+            "the split point must never extend a host audio slice"
+        );
+
+        let resumed = input_event_timing(1_024, first_segment.absolute, FRAMES);
+        assert_eq!(resumed.absolute, FRAMES - 1);
+        assert_eq!(resumed.relative, 0);
+        assert!(
+            resumed.absolute <= first_segment.absolute,
+            "the clamped boundary event must be consumed when processing resumes"
+        );
+    }
+
+    #[test]
+    fn state_reservation_failure_is_returned_instead_of_aborting() {
+        let Ok(length) = usize::try_from(MAX_STATE_BYTES) else {
+            return;
+        };
+        let mut state = TestStream {
+            bytes: Vec::new(),
+            position: 0,
+        };
+        let stream = stream_for(&mut state);
+
+        REFUSE_LARGE_ALLOCATION.store(true, Ordering::Relaxed);
+        let result = read_declared_state(&stream, length);
+        REFUSE_LARGE_ALLOCATION.store(false, Ordering::Relaxed);
+
+        assert_eq!(result, Err(StateReadError::Allocation));
+        assert_eq!(
+            state.position, 0,
+            "allocation failure must not touch the stream"
+        );
+    }
+
+    #[test]
+    fn state_reader_consumes_only_the_declared_span() {
+        let mut state = TestStream {
+            bytes: b"state-following-item".to_vec(),
+            position: 0,
+        };
+        let stream = stream_for(&mut state);
+
+        let payload = read_declared_state(&stream, 5).expect("the declared payload is available");
+
+        assert_eq!(payload, b"state");
+        assert_eq!(
+            state.position, 5,
+            "bytes after the state belong to the host stream"
+        );
+    }
+
+    // MXM PATCH (defect 2, refreshed onto 0.4.2): since 0.4, `read_stream()` reports a short read
+    // as `Some(bytes_read)` instead of `false`, and upstream's loader parses that prefix.
+    #[test]
+    fn state_reader_refuses_a_stream_shorter_than_the_declared_payload() {
+        let mut state = TestStream {
+            bytes: b"sta".to_vec(),
+            position: 0,
+        };
+        let stream = stream_for(&mut state);
+
+        assert_eq!(read_declared_state(&stream, 5), Err(StateReadError::Stream));
+    }
+
+    struct TailProbe {
+        status: *const AtomicCell<ProcessStatus>,
+        calls: AtomicUsize,
+        observed_infinite: AtomicBool,
+    }
+
+    unsafe extern "C" fn tail_changed_probe(host: *const clap_host) {
+        let probe = unsafe { &*((*host).host_data as *const TailProbe) };
+        let status = unsafe { &*probe.status }.load();
+        probe
+            .observed_infinite
+            .store(has_infinite_tail(status), Ordering::Release);
+        probe.calls.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[test]
+    fn tail_callback_observes_the_new_class_and_fires_only_on_finite_infinite_edges() {
+        let status = AtomicCell::new(ProcessStatus::Normal);
+        let probe = TailProbe {
+            status: &status,
+            calls: AtomicUsize::new(0),
+            observed_infinite: AtomicBool::new(false),
+        };
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: (&probe as *const TailProbe).cast_mut().cast::<c_void>(),
+            name: c"tail-test".as_ptr(),
+            vendor: c"mxm".as_ptr(),
+            url: c"".as_ptr(),
+            version: c"1".as_ptr(),
+            get_extension: None,
+            request_restart: None,
+            request_process: None,
+            request_callback: None,
+        };
+
+        publish_process_status(
+            &status,
+            ProcessStatus::Tail(64),
+            &host,
+            Some(tail_changed_probe),
+        );
+        assert_eq!(probe.calls.load(Ordering::Acquire), 0);
+
+        publish_process_status(
+            &status,
+            ProcessStatus::KeepAlive,
+            &host,
+            Some(tail_changed_probe),
+        );
+        assert_eq!(probe.calls.load(Ordering::Acquire), 1);
+        assert!(probe.observed_infinite.load(Ordering::Acquire));
+
+        publish_process_status(
+            &status,
+            ProcessStatus::KeepAlive,
+            &host,
+            Some(tail_changed_probe),
+        );
+        assert_eq!(probe.calls.load(Ordering::Acquire), 1);
+
+        publish_process_status(
+            &status,
+            ProcessStatus::Normal,
+            &host,
+            Some(tail_changed_probe),
+        );
+        assert_eq!(probe.calls.load(Ordering::Acquire), 2);
+        assert!(!probe.observed_infinite.load(Ordering::Acquire));
     }
 }
