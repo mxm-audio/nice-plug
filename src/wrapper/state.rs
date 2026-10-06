@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -9,6 +10,57 @@ use nice_plug_core::{
     params::{InternalParamMut, Param, Params, internals::ParamPtr},
     plugin::{ParamValue, Plugin, PluginState},
 };
+
+// MXM PATCH (defect 11): defect 9 must distinguish a field that rejected its input from one that
+// accepted it and immediately installed a canonical representation. `PersistentField::set()` has no
+// return value and nice-plug-core is a separate published crate, so the wrapper opens this scoped,
+// same-thread acknowledgement channel only around `Params::deserialize_fields()`. A field may mark
+// its stable persisted key only after successful canonical publication; marks outside a restore are
+// discarded and cannot weaken a later transaction.
+thread_local! {
+    static CANONICALIZED_FIELDS: RefCell<Vec<BTreeSet<&'static str>>> = RefCell::new(Vec::new());
+}
+
+/// Acknowledge that the current persistent-field restore accepted `field_key` and installed a
+/// canonical value. Calling this outside `Params::deserialize_fields()` has no effect.
+pub fn accept_canonicalized_persistent_field(field_key: &'static str) {
+    CANONICALIZED_FIELDS.with(|scopes| {
+        if let Some(fields) = scopes.borrow_mut().last_mut() {
+            fields.insert(field_key);
+        }
+    });
+}
+
+struct CanonicalizedFieldScope {
+    active: bool,
+}
+
+impl CanonicalizedFieldScope {
+    fn begin() -> Self {
+        CANONICALIZED_FIELDS.with(|scopes| scopes.borrow_mut().push(BTreeSet::new()));
+        Self { active: true }
+    }
+
+    fn finish(mut self) -> BTreeSet<&'static str> {
+        self.active = false;
+        CANONICALIZED_FIELDS.with(|scopes| {
+            scopes
+                .borrow_mut()
+                .pop()
+                .expect("canonicalized-field restore scope")
+        })
+    }
+}
+
+impl Drop for CanonicalizedFieldScope {
+    fn drop(&mut self) {
+        if self.active {
+            CANONICALIZED_FIELDS.with(|scopes| {
+                scopes.borrow_mut().pop();
+            });
+        }
+    }
+}
 
 /// Create a parameters iterator from the hashtables stored in the plugin wrappers. This avoids
 /// having to call `.param_map()` again, which may include expensive user written code.
@@ -195,9 +247,86 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
 
     // The plugin can also persist arbitrary fields alongside its parameters. This is useful for
     // storing things like sample data.
+    let canonicalized_scope = CanonicalizedFieldScope::begin();
     plugin_params.deserialize_fields(&state.fields);
+    let canonicalized_fields = canonicalized_scope.finish();
 
-    true
+    // MXM PATCH (defects 9 and 11): `PersistentField::set()` is intentionally infallible and may
+    // reject malformed or unpreparable durable content by preserving its previous value. Detect
+    // that rejection generically by requiring every supplied field to serialize back identically.
+    // A field that deliberately installed a different canonical value is accepted only when that
+    // exact stable key explicitly acknowledged successful canonicalization in the scoped call above.
+    // This keeps a genuine mismatch on defect 8's complete rollback path without treating every
+    // difference as acceptance.
+    let restored_fields = plugin_params.serialize_fields();
+    state.fields.iter().all(|(key, requested)| {
+        restored_fields.get(key).is_some_and(|restored| {
+            persisted_field_accepted(key, requested, restored, &canonicalized_fields)
+        })
+    })
+}
+
+fn persisted_field_accepted(
+    key: &str,
+    requested: &str,
+    restored: &str,
+    canonicalized_fields: &BTreeSet<&'static str>,
+) -> bool {
+    persisted_field_matches(requested, restored) || canonicalized_fields.contains(key)
+}
+
+fn persisted_field_matches(requested: &str, restored: &str) -> bool {
+    requested == restored
+        || serde_json::from_str::<serde_json::Value>(requested)
+            .ok()
+            .zip(serde_json::from_str::<serde_json::Value>(restored).ok())
+            .is_some_and(|(requested, restored)| requested == restored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalized_field_acceptance_is_scoped_and_key_specific() {
+        accept_canonicalized_persistent_field("response");
+
+        let scope = CanonicalizedFieldScope::begin();
+        accept_canonicalized_persistent_field("response");
+        let accepted = scope.finish();
+        assert!(accepted.contains("response"));
+        assert!(!accepted.contains("preset"));
+        assert!(persisted_field_accepted(
+            "response",
+            r#"{"value": 200}"#,
+            r#"{"value": 100}"#,
+            &accepted,
+        ));
+        assert!(
+            !persisted_field_accepted(
+                "preset",
+                r#"{"name": "requested"}"#,
+                r#"{"name": "previous"}"#,
+                &accepted,
+            ),
+            "acknowledging response must not admit a rejected preset"
+        );
+
+        let next_scope = CanonicalizedFieldScope::begin();
+        assert!(next_scope.finish().is_empty(), "an old mark leaked");
+    }
+
+    #[test]
+    fn canonicalized_field_scope_clears_on_unwind() {
+        let _ = std::panic::catch_unwind(|| {
+            let _scope = CanonicalizedFieldScope::begin();
+            accept_canonicalized_persistent_field("response");
+            panic!("exercise scope drop");
+        });
+
+        let next_scope = CanonicalizedFieldScope::begin();
+        assert!(next_scope.finish().is_empty(), "a panic leaked acceptance");
+    }
 }
 
 /// Deserialize a plugin's state from a vector containing (compressed) JSON data. Doesn't load the

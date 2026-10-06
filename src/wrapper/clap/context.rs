@@ -121,7 +121,19 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     }
 
     fn send_event(&mut self, event: PluginNoteEvent<P>) {
-        self.output_events_guard.push_back(event);
+        // MXM PATCH (defect 1): plugin output shares the activation-time hard queue bound. A
+        // reservation is not a realtime guarantee when a plugin emits more events than policy.
+        // Under overflow, the newest termination replaces the oldest queued event in O(1) instead
+        // of being dropped or triggering a queue-length scan.
+        if self.output_events_guard.len() < self.wrapper.event_queue_limit() {
+            self.output_events_guard.push_back(event);
+        } else {
+            self.wrapper.note_dropped_output_event();
+            if Wrapper::<P>::is_release_event(&event) {
+                let _ = self.output_events_guard.pop_front();
+                self.output_events_guard.push_back(event);
+            }
+        }
     }
 
     fn set_latency_samples(&self, samples: u32) {
