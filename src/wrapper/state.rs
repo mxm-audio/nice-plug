@@ -18,7 +18,8 @@ use nice_plug_core::{
 // its stable persisted key only after successful canonical publication; marks outside a restore are
 // discarded and cannot weaken a later transaction.
 thread_local! {
-    static CANONICALIZED_FIELDS: RefCell<Vec<BTreeSet<&'static str>>> = RefCell::new(Vec::new());
+    static CANONICALIZED_FIELDS: RefCell<Vec<BTreeSet<&'static str>>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Acknowledge that the current persistent-field restore accepted `field_key` and installed a
@@ -197,7 +198,8 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
         let param_ptr = match params_getter(param_id_str.as_str()) {
             Some(ptr) => ptr,
             None => {
-                crate::nice_debug_assert_failure!("Unknown parameter: {}", param_id_str);
+                #[cfg(debug_assertions)]
+                crate::nice_warn!("Unknown parameter: {}", param_id_str);
                 continue;
             }
         };
@@ -221,15 +223,18 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
                 }
                 (ParamPtr::EnumParam(p), ParamValue::String(id)) => {
                     let deserialized_enum = (*p).set_from_id(id);
-                    crate::nice_debug_assert!(
-                        deserialized_enum,
-                        "Unknown ID {:?} for enum parameter \"{}\"",
-                        id,
-                        param_id_str,
-                    );
+                    if !deserialized_enum {
+                        #[cfg(debug_assertions)]
+                        crate::nice_warn!(
+                            "Unknown ID {:?} for enum parameter \"{}\"",
+                            id,
+                            param_id_str,
+                        );
+                    }
                 }
                 (param_ptr, param_value) => {
-                    crate::nice_debug_assert_failure!(
+                    #[cfg(debug_assertions)]
+                    crate::nice_warn!(
                         "Invalid serialized value {:?} for parameter \"{}\" ({:?})",
                         param_value,
                         param_id_str,
@@ -281,52 +286,6 @@ fn persisted_field_matches(requested: &str, restored: &str) -> bool {
             .ok()
             .zip(serde_json::from_str::<serde_json::Value>(restored).ok())
             .is_some_and(|(requested, restored)| requested == restored)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canonicalized_field_acceptance_is_scoped_and_key_specific() {
-        accept_canonicalized_persistent_field("response");
-
-        let scope = CanonicalizedFieldScope::begin();
-        accept_canonicalized_persistent_field("response");
-        let accepted = scope.finish();
-        assert!(accepted.contains("response"));
-        assert!(!accepted.contains("preset"));
-        assert!(persisted_field_accepted(
-            "response",
-            r#"{"value": 200}"#,
-            r#"{"value": 100}"#,
-            &accepted,
-        ));
-        assert!(
-            !persisted_field_accepted(
-                "preset",
-                r#"{"name": "requested"}"#,
-                r#"{"name": "previous"}"#,
-                &accepted,
-            ),
-            "acknowledging response must not admit a rejected preset"
-        );
-
-        let next_scope = CanonicalizedFieldScope::begin();
-        assert!(next_scope.finish().is_empty(), "an old mark leaked");
-    }
-
-    #[test]
-    fn canonicalized_field_scope_clears_on_unwind() {
-        let _ = std::panic::catch_unwind(|| {
-            let _scope = CanonicalizedFieldScope::begin();
-            accept_canonicalized_persistent_field("response");
-            panic!("exercise scope drop");
-        });
-
-        let next_scope = CanonicalizedFieldScope::begin();
-        assert!(next_scope.finish().is_empty(), "a panic leaked acceptance");
-    }
 }
 
 /// Deserialize a plugin's state from a vector containing (compressed) JSON data. Doesn't load the
@@ -382,4 +341,51 @@ pub(crate) unsafe fn deserialize_json(state: &[u8]) -> Option<PluginState> {
     };
 
     result
+}
+
+// MXM PATCH (defect 11): kept after every item, as `clippy::items_after_test_module` requires.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalized_field_acceptance_is_scoped_and_key_specific() {
+        accept_canonicalized_persistent_field("response");
+
+        let scope = CanonicalizedFieldScope::begin();
+        accept_canonicalized_persistent_field("response");
+        let accepted = scope.finish();
+        assert!(accepted.contains("response"));
+        assert!(!accepted.contains("preset"));
+        assert!(persisted_field_accepted(
+            "response",
+            r#"{"value": 200}"#,
+            r#"{"value": 100}"#,
+            &accepted,
+        ));
+        assert!(
+            !persisted_field_accepted(
+                "preset",
+                r#"{"name": "requested"}"#,
+                r#"{"name": "previous"}"#,
+                &accepted,
+            ),
+            "acknowledging response must not admit a rejected preset"
+        );
+
+        let next_scope = CanonicalizedFieldScope::begin();
+        assert!(next_scope.finish().is_empty(), "an old mark leaked");
+    }
+
+    #[test]
+    fn canonicalized_field_scope_clears_on_unwind() {
+        let _ = std::panic::catch_unwind(|| {
+            let _scope = CanonicalizedFieldScope::begin();
+            accept_canonicalized_persistent_field("response");
+            panic!("exercise scope drop");
+        });
+
+        let next_scope = CanonicalizedFieldScope::begin();
+        assert!(next_scope.finish().is_empty(), "a panic leaked acceptance");
+    }
 }

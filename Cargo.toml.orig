@@ -1,6 +1,6 @@
 [package]
 name = "nice-plug"
-version = "0.3.0"
+version = "0.4.2"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -37,6 +37,9 @@ standalone = [
   "dep:audioadapter-buffers",
   "dep:ctrlc"
 ]
+# Enables ASIO for the standalone wrapper. This is separate from `standalone` so plugin and
+# non-Windows standalone builds do not need the ASIO SDK toolchain.
+standalone-asio = ["standalone", "cpal/asio"]
 # Enables the `nice_export_vst3!()` macro. Enabled by default.
 vst3 = ["dep:vst3", "dep:widestring"]
 # Add adapters to the Buffer object for reading the channel data to and from
@@ -50,6 +53,17 @@ zstd = ["dep:zstd"]
 # Enables using `tracing-subscriber` as a fallback if the user has not set up a
 # logger in Plugin::setup_logger().
 tracing-subscriber = ["dep:tracing-subscriber"]
+# Allows editors to use a workaround to fix broken dpi scaling issues on Windows when running in
+# standalone mode (see: https://github.com/RustAudio/baseview/issues/321)
+#
+# This is generally safe to enable for most plugins. The only case where it *should not*
+# be enabled is if your plugin hosts other plugins.
+#
+# More specifically, do *NOT* enable this if any of the following applies:
+# * Multiple `baseview` versions are present in the final binary
+# * `baseview` is being used in conjunction with other platform windowing libraries (e.g. `winit`, `SDL`, etc.)
+# * The current process may host other plugins that need to interact with the platform's GUI capabilities
+unsafe_standalone_dpi_fix = []
 # Enables setting the "flush to zero" CPU flag to avoid denormal numbers when
 # processing. This can lead to a significant performance increases in some cases.
 #
@@ -72,7 +86,7 @@ unsafe_flush_denormals = []
 
 [dependencies]
 nice-plug-derive = { path = "../nice-plug-derive", version = "0.1.2" }
-nice-plug-core = { path = "../nice-plug-core", version = "0.3.0", default-features = false }
+nice-plug-core = { path = "../nice-plug-core", version = "0.4.2", default-features = false }
 nice-assert-no-alloc = { version = "1.0", features = ["backtrace", "log"], optional = true }
 nice-log = { path = "../nice-log", version = "0.3.1" }
 clap-sys = "0.5.0"
@@ -83,6 +97,7 @@ clap = { version = "4.1.8", features = [
 ], optional = true }
 parking_lot.workspace = true
 atomic_refcell.workspace = true
+try-lock = "0.2.5"
 crossbeam.workspace = true
 anymap3 = "1.0.1"
 anyhow.workspace = true
@@ -97,8 +112,8 @@ zstd = { version = "0.13.3", optional = true }
 cpal = { version = "0.18.2", optional = true }
 jack = { version = "0.13.5", optional = true }
 midir = { version = "0.11.0", optional = true }
-fixed-resample = { version = "0.12.0", default-features = false, features = ["channel"], optional = true }
-audioadapter-buffers = { version = "4.0", optional = true }
+fixed-resample = { version = "0.13.0", default-features = false, features = ["channel"], optional = true }
+audioadapter-buffers = { version = "5.2", optional = true }
 rtrb = { workspace = true, optional = true }
 # Used for the `vst3` feature
 vst3 = { version = "0.3.0", optional = true }
