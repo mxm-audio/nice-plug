@@ -74,11 +74,19 @@ and reset under the lock, with a complete rollback (without `reset()`) on failur
 lock off the audio thread for up to one second, as upstream's `activate()` does. A timeout refuses
 the load without mutating anything.
 
-While the transaction holds the lock, a concurrent `process()` now discards its block with
-`CLAP_PROCESS_ERROR`. Under 0.3.0 the mutex made it block until the transaction finished instead. A
-new `state_transaction_active` flag makes that discard silent, because `nice_error!` is not
+While the transaction holds the lock, a concurrent `process()` skips the rest of its buffer: it
+writes silence from that point to every output channel (`silence_outputs_from`) and returns
+`CLAP_PROCESS_CONTINUE`. Under 0.3.0 the mutex made it block until the transaction finished
+instead. A new `state_transaction_active` flag tells this skip from upstream's misbehaving-host case
+(which still logs and returns `CLAP_PROCESS_ERROR`) and keeps it silent, because `nice_error!` is not
 allocation-permitted on the audio thread and a log line there could abort a debug
-`assert_process_allocs` build.
+`assert_process_allocs` build. The load resets the plugin, so a note-off skipped here cannot leave a
+note hanging. Regression: `mxm_state_tests::a_block_skipped_during_a_state_load_is_silence_from_the_skip_onwards`.
+
+*First version of this refresh (same day), superseded:* the skip returned `CLAP_PROCESS_ERROR`.
+Porting MXM Player showed what that does to a host: the player marks the plugin failed
+(`RunState::Failed`) and keeps it silent until a reset, and a DAW may react the same way — when the
+plugin is only loading a preset, which the editors do during playback.
 
 The audio-thread GUI-state handoff, which 0.4.2 still has, is removed as before. That leaves two
 pieces of upstream code to annotate rather than delete: `Task::RescanParamValues` has no sender any
@@ -105,9 +113,11 @@ player are rebuilt.
   limit of at least 1,024 from `INPUT_EVENT_CAPACITY`. Its 2,001 events no longer exceed twice the
   limit, so it stops exercising the skipped middle. To restore that, send more than twice the limit
   or declare `INPUT_EVENT_CAPACITY = 512` in the test plugin.
-- **State load during processing.** This now drops this plugin's blocks for the length of the
-  transaction instead of stalling the audio thread. A regression that loads state while processing
-  concurrently and compares tails bit for bit will see that.
+- **State load during processing.** This now silences this plugin's blocks for the length of the
+  transaction instead of stalling the audio thread, and the host carries on. A regression that
+  loads state while processing concurrently and compares tails bit for bit will see that.
+  *Checked when the player was ported (2026-10-06):* no player test does; two load state while the
+  fake backend streams and check only the command's answer.
 - **State cap.** The cap is 256 MiB instead of 512 MiB.
 
 **Checks run for this refresh** (2026-10-06, Windows, Rust 1.98.0, this crate only):
@@ -310,8 +320,10 @@ builds at that floor (`docs/known-issues.md`, *Two crates declared an MSRV they 
 - The plugin lock is now upstream's non-blocking `TryLock`. It is polled for off the audio thread for
   up to one second, and a timeout refuses the load before anything is mutated.
 - Upstream dropped post-load reactivation; it is kept here.
-- A concurrent `process()` discards its block with `CLAP_PROCESS_ERROR` instead of blocking. The
-  `state_transaction_active` flag keeps that path from logging on the audio thread.
+- A concurrent `process()` writes silence for the rest of its buffer and returns
+  `CLAP_PROCESS_CONTINUE` instead of blocking. The `state_transaction_active` flag keeps that path
+  from logging on the audio thread. (The refresh's first version returned `CLAP_PROCESS_ERROR`
+  there, which MXM Player treats as a failed plugin; see *Defect 8 on 0.4.2*.)
 - `StateChanged`, which now also triggers the host rescan, follows every transaction that took the
   lock.
 - The nested-`if` note above is superseded: 0.4.2 declares Rust 1.88, so the reactivations are

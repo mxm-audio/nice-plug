@@ -121,6 +121,34 @@ fn output_parameter_event_capacity(parameter_count: usize) -> usize {
         .min(MAX_EVENT_CAPACITY)
 }
 
+/// MXM PATCH (defect 8, refreshed onto 0.4.2): silence every output channel from `start` to the
+/// end of the host's buffer. A block the plugin skips while a state load holds its lock must still
+/// leave defined output, and samples before `start` were already processed in this call.
+///
+/// # Safety
+///
+/// `process` must be the host's `clap_process` for this call, with valid output buffers.
+unsafe fn silence_outputs_from(process: &clap_process, start: usize) {
+    let frames = process.frames_count as usize;
+    if process.audio_outputs.is_null() || start >= frames {
+        return;
+    }
+    for port in 0..process.audio_outputs_count as usize {
+        // SAFETY: the host guarantees `audio_outputs_count` buffers, each with `channel_count`
+        // channels of `frames_count` samples.
+        let buffer = unsafe { &*process.audio_outputs.add(port) };
+        if buffer.data32.is_null() {
+            continue;
+        }
+        for channel in 0..buffer.channel_count as usize {
+            let samples = unsafe { *buffer.data32.add(channel) };
+            if !samples.is_null() {
+                unsafe { std::ptr::write_bytes(samples.add(start), 0, frames - start) };
+            }
+        }
+    }
+}
+
 #[inline]
 fn has_infinite_tail(status: ProcessStatus) -> bool {
     matches!(status, ProcessStatus::KeepAlive)
@@ -2598,10 +2626,16 @@ impl<P: ClapPlugin> Wrapper<P> {
                     let Some(mut plugin) = wrapper.plugin.try_lock() else {
                         // MXM PATCH (defect 8, refreshed onto 0.4.2): a GUI or host state load
                         // holds this lock on purpose for its whole rollback-capable transaction.
-                        // That is not a misbehaving host, so discard the block without logging:
-                        // `nice_error!` is not allocation-permitted on this thread.
+                        // That is not a misbehaving host, so skip the rest of the buffer without
+                        // logging (`nice_error!` is not allocation-permitted on this thread): its
+                        // output is silence and the host carries on. An error would tell the host
+                        // the plugin failed — MXM Player then holds it failed until a reset — when
+                        // it is only loading a preset. The load resets the plugin, so a note-off
+                        // skipped here cannot leave a note hanging.
                         if wrapper.state_transaction_active.load(Ordering::SeqCst) {
-                            return CLAP_PROCESS_ERROR;
+                            // SAFETY: `process` is this call's host buffer.
+                            unsafe { silence_outputs_from(process, block_start) };
+                            return CLAP_PROCESS_CONTINUE;
                         }
 
                         // On the occasion a host misbehaves and tries to activate/deactivate a plugin
@@ -4279,5 +4313,49 @@ mod mxm_state_tests {
         );
         assert_eq!(probe.calls.load(Ordering::Acquire), 2);
         assert!(!probe.observed_infinite.load(Ordering::Acquire));
+    }
+
+    /// A block skipped while a state load holds the lock leaves silence from the skip onwards and
+    /// keeps what this call already processed, on every port and channel; a port without 32-bit
+    /// data is passed over, not dereferenced.
+    #[test]
+    fn a_block_skipped_during_a_state_load_is_silence_from_the_skip_onwards() {
+        use clap_sys::audio_buffer::clap_audio_buffer;
+
+        let mut left = [1.0_f32; 8];
+        let mut right = [1.0_f32; 8];
+        let mut mono = [1.0_f32; 8];
+        let mut stereo = [left.as_mut_ptr(), right.as_mut_ptr()];
+        let mut single = [mono.as_mut_ptr()];
+        let port = |data32: *mut *mut f32, channel_count| clap_audio_buffer {
+            data32,
+            data64: std::ptr::null_mut(),
+            channel_count,
+            latency: 0,
+            constant_mask: 0,
+        };
+        let mut outputs = [
+            port(stereo.as_mut_ptr(), 2),
+            port(std::ptr::null_mut(), 2),
+            port(single.as_mut_ptr(), 1),
+        ];
+        let process = clap_process {
+            steady_time: -1,
+            frames_count: 8,
+            transport: std::ptr::null(),
+            audio_inputs: std::ptr::null(),
+            audio_outputs: outputs.as_mut_ptr(),
+            audio_inputs_count: 0,
+            audio_outputs_count: outputs.len() as u32,
+            in_events: std::ptr::null(),
+            out_events: std::ptr::null(),
+        };
+
+        // SAFETY: every pointer above outlives the call and spans `frames_count` samples.
+        unsafe { silence_outputs_from(&process, 3) };
+
+        for channel in [left, right, mono] {
+            assert_eq!(channel, [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        }
     }
 }
