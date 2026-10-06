@@ -18,6 +18,8 @@ The idea is to have a stateful yet simple plugin API that gets rid of as much
 unnecessary ceremony wherever possible, while also keeping the amount of magic to
 a minimum and making it easy to experiment with different approaches to things.
 
+> This project is currently experimental, and has recently undergone some large changes, so expect some bugs. If you find any, please create an issue!
+
 ---
 
 > nice-plug started out as a fork of the awesome [NIH-plug](https://github.com/robbert-vdh/nih-plug)
@@ -42,6 +44,8 @@ a minimum and making it easy to experiment with different approaches to things.
 
 See [Getting Started with nice-plug](https://codeberg.org/RustAudio/nice-plug/src/branch/main/GETTING_STARTED.md)
 for a quick guide on getting started with using nice-plug to develop your own plugins.
+
+A [cookiecutter template](https://codeberg.org/RustAudio/nice-plug-template) is also available.
 
 # Features
 
@@ -139,6 +143,8 @@ Also, keep in mind that none of these options currently have good documentation
 for how to create plugin GUIs with them. For now, take a look at the examples
 to get started. (Feel free to contribute any guides, documentation, and or
 example plugins!)
+
+> It is recommended to not even worry about GUI when developing the DSP of your plugin, especially if you are just starting out learning DSP. nice-plug makes it easy to create GUI-less plugins!
 
 # Example plugins
 
