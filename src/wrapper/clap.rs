@@ -4,6 +4,8 @@ mod util;
 mod context;
 mod descriptor;
 pub mod features;
+// MXM PATCH (note names): the capability's state, see `ClapPlugin::note_names`.
+mod note_names;
 mod wrapper;
 
 use crate::wrapper::clap::features::ClapFeature;
@@ -18,6 +20,7 @@ pub use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 pub use clap_sys::version::CLAP_VERSION;
 use nice_plug_core::context::remote_controls::RemoteControlsContext;
 use nice_plug_core::plugin::Plugin;
+use std::sync::Arc;
 
 /// Provides auxiliary metadata needed for a CLAP plugin.
 #[allow(unused_variables)]
@@ -43,6 +46,44 @@ pub trait ClapPlugin: Plugin {
     /// that the host can use to provide better hardware mapping for a plugin. See the linked
     /// extension for more information.
     fn remote_controls(&self, context: &mut impl RemoteControlsContext) {}
+
+    // MXM PATCH (note names): a capability, not a fix. See `PATCHES.md`, *Note names*.
+    /// The names this plugin gives its notes, through CLAP's [note-name
+    /// extension](https://github.com/free-audio/clap/blob/main/include/clap/ext/note-name.h): a
+    /// drum machine naming the drum on each key, say. `None`, the default, offers no names and no
+    /// extension.
+    ///
+    /// Called once, while the wrapper is built, as [`remote_controls()`][Self::remote_controls()]
+    /// is, so the source must read what it names from shared state (the parameters' values, a
+    /// persistent field), never from the plugin itself: serving names never takes the plugin's
+    /// lock. The wrapper reads the names again, and tells the host when they differ, after a
+    /// parameter the source [depends on][ClapNoteNames::depends_on()] changes, after any state
+    /// load, and after any GUI state transaction, the dirty-only form included.
+    fn note_names(&self) -> Option<Arc<dyn ClapNoteNames>> {
+        None
+    }
+}
+
+// MXM PATCH (note names): one name a plugin gives its notes. See `ClapPlugin::note_names`.
+/// One name for a note, as CLAP's `clap_note_name` holds it: `-1` for the port, the key or the
+/// channel means any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteName {
+    pub name: String,
+    /// The note port's index, as note events carry it.
+    pub port: i16,
+    pub key: i16,
+    pub channel: i16,
+}
+
+// MXM PATCH (note names): where a plugin's note names come from. See `ClapPlugin::note_names`.
+/// Where a plugin's note names come from.
+pub trait ClapNoteNames: Send + Sync {
+    /// The names now. Called on the main thread only, never the audio thread, so it may allocate.
+    fn names(&self) -> Vec<NoteName>;
+    /// The IDs of the parameters the names depend on. A change to one of them makes the wrapper
+    /// read the names again; any other parameter's change doesn't.
+    fn depends_on(&self) -> Vec<&'static str>;
 }
 
 /// Configuration for the plugin's polyphonic modulation options, if it supports .

@@ -2,8 +2,8 @@
 
 **Since 2026-10-06 this is `nice-plug 0.4.2` exactly as published on crates.io**, plus the MXM
 patches that 0.4.2 has not made redundant: seven of the eleven numbered fixes (1, 2, 7, 8, 9, 10 and
-11; 1, 2 and 8 reworked for 0.4.2) and all three capability changes. Fixes 3, 4, 5 and 6 were
-dropped because 0.4.2 does the same thing. The numbering is unchanged, so every older reference
+11; 1, 2 and 8 reworked for 0.4.2) and four capability changes, the fourth (note names) added on
+2026-10-14. Fixes 3, 4, 5 and 6 were dropped because 0.4.2 does the same thing. The numbering is unchanged, so every older reference
 still resolves. See [*Refresh to 0.4.2*](#refresh-to-042--2026-10-06) for the per-patch status.
 
 *Before the refresh (superseded):* This is **`nice-plug 0.3.0` exactly as published on crates.io**,
@@ -12,13 +12,14 @@ root `Cargo.toml`.
 
 Every change is marked `MXM PATCH` in the source, so `grep -rn "MXM PATCH" src/` finds the complete
 delta. Since the 0.4.2 refresh it lives in `src/wrapper/clap/wrapper.rs`, `src/wrapper/state.rs`
-and the one re-export in `src/wrapper.rs`. Hunks reworked by the refresh say
+and the one re-export in `src/wrapper.rs`; the note names add `src/wrapper/clap.rs`,
+`src/wrapper/clap/note_names.rs` and `src/prelude.rs`. Hunks reworked by the refresh say
 `refreshed onto 0.4.2` in their marker. *(0.3.0, superseded: it lived in
 `src/wrapper/clap/wrapper.rs` and `src/wrapper/state.rs`, plus the output-push guard in
 `src/wrapper/clap/context.rs`. 0.4 removed the wrapper's output queue that the guard bounded.)*
 
-**The last three are different in kind from the eleven** — they are not defect fixes. See
-*GUI-authored state dirty*, *Floating windows* and *GUI-task process wake*, below.
+**The four capabilities are different in kind from the eleven** — they are not defect fixes. See
+*GUI-authored state dirty*, *Floating windows*, *GUI-task process wake* and *Note names*, below.
 
 ## Refresh to 0.4.2 — 2026-10-06
 
@@ -465,9 +466,11 @@ the player's still-unlocated stop timeout. No source in this vendored copy was c
    - the GUI-authored state-dirty hunk
    - the floating-window hunks
    - the GUI-task process-wake hunk
+   - the note-name hunks: the API in `src/wrapper/clap.rs` and its re-export in `src/prelude.rs`,
+     `src/wrapper/clap/note_names.rs` whole, and the wiring and tests in `wrapper.rs`
 
-   `grep -rn "MXM PATCH"` on the *old* copy shows exactly what they were: 47 markers after the 0.4.2
-   refresh, 39 before it. For each hunk, first check whether upstream now does the same thing,
+   `grep -rn "MXM PATCH"` on the *old* copy shows exactly what they were: 72 markers since the note
+   names (2026-10-14), 48 before them, 47 just after the 0.4.2 refresh, 39 before it. For each hunk, first check whether upstream now does the same thing,
    including the edge cases its paragraph names. That check dropped 3, 4, 5 and 6 in the 0.4.2
    refresh; their paragraphs say where upstream does it. If unsure, keep the hunk and say so.
 
@@ -540,8 +543,8 @@ the player's still-unlocated stop timeout. No source in this vendored copy was c
 ## Removing this copy
 
 Remove `vendor/nice-plug/` and the `[patch.crates-io]` redirect only when the replacement fixes all
-eleven defects **and preserves GUI-authored state dirty reporting and floating-window support,
-including local-only floating resizing**.
+eleven defects **and preserves GUI-authored state dirty reporting, floating-window support,
+including local-only floating resizing, and plugin note names**.
 
 *(0.4.2 refresh: upstream 0.4.2 already covers 3, 4, 5 and 6. A replacement must still cover:*
 
@@ -550,7 +553,7 @@ including local-only floating resizing**.
 - *defect 7*
 - *defect 8, including reactivation after a state load, which upstream 0.4 removed*
 - *defects 9, 10 and 11*
-- *the three capabilities)*
+- *the four capabilities)*
 Bump the pin and run the existing regressions against freshly rebuilt bundles. Keep those tests
 after removing the patch: they prove the upstream replacement actually preserves behavior.
 
@@ -682,3 +685,58 @@ cargo test -p mxm-player --test editor_resize -- --ignored --nocapture
 
 The driver needs a Windows desktop. Linux/macOS and embedded DAW resize behavior are not verified
 by it. Reapply the callback hunks as part of floating support on refresh, not just its advertisement.
+
+## Note names — a capability, not a fix
+
+*Added 2026-10-14.* nice-plug offers no way for a plugin to name its notes, and CLAP's note-name
+extension (`clap.note-name`) is how a host learns them: which drum is on which key. newDAWn's tracker
+gives each drum a lane titled with the instrument's name for it, and MXM Drum Machine names each
+slot (bd1, sn1, or what the user typed). Without this the host falls back to General MIDI's names,
+which are wrong for those slots.
+
+**The API**, in `src/wrapper/clap.rs` and the prelude: `ClapPlugin::note_names()`, `None` by
+default, returns a source, a `ClapNoteNames` with `names()` (a list of `NoteName`: name, port,
+key, channel, `-1` meaning any) and `depends_on()` (the parameter IDs the names follow).
+
+**How it works:**
+- The wrapper asks for the source once, while it is built, as it does the remote control pages. The
+  source reads shared state (parameter values, persistent fields), never the plugin, so serving
+  names never takes the plugin's lock.
+- `CLAP_EXT_NOTE_NAME` is offered only when there is a source. `count()` reads the names on the main
+  thread and `get()` serves what `count()` took.
+- A change that may rename a note **raises a flag** (`note_names.rs`): an atomic swap, safe on the
+  audio thread. The first raise posts `Task::NoteNamesChanged`; the main-thread check takes the flag,
+  reads the names, and calls the host's `changed()` only when they differ from what the host last
+  knew. The flag is taken before the names are read, so a change while they're read is checked in
+  turn.
+- **What raises it:** a change to a parameter in `depends_on()` (`update_plain_value_by_hash`, which
+  host automation, flushes and editor edits all go through); `Task::StateChanged`, after every host
+  state load and full GUI transaction; and the GUI transaction's dirty-only form, which skips
+  `set_state_inner()` and so has no `StateChanged`. A plugin publishing a persistent field that
+  names a note sends that dirty-only transaction after it, as *GUI-authored state dirty* describes.
+- **A full task queue loses no change.** The flag stays raised and the host is asked for a
+  main-thread callback; `on_main_thread()` checks the flag after draining the queue.
+- It is not editor-gated: a plugin without a window still tells the host.
+
+**Regression tests:**
+- `wrapper::clap::note_names::tests`: the flag, the comparison, what `get()` serves, and a raise
+  whose task never ran still being checked;
+- `wrapper::clap::wrapper::mxm_note_name_tests`, a whole wrapper and a host that counts what it is
+  told:
+  - only a plugin with names offers the extension;
+  - the host reads what the plugin gives;
+  - a parameter the names depend on tells the host once, and no other does;
+  - the dirty-only GUI transaction reads them again (and, with the editor feature, marks the host's
+    state dirty);
+  - a state load that renames tells the host;
+  - with the task queue full, a change off the main thread is told at the next main-thread callback
+    (without the editor feature, where the parameter's own editor task would assert on the full
+    queue).
+
+**Checks run** (2026-10-14, Windows, Rust 1.98.0, this crate only):
+- `cargo clippy --locked --all-targets -- -D warnings -A clippy::unnecessary_cast` and `cargo clippy
+  --locked --all-targets --no-default-features -- -D warnings -A clippy::needless_return`: clean;
+  the two lints allowed are upstream's own, as in the 0.4.2 refresh's checks above.
+- `cargo test --locked --lib --no-default-features -- note_name`: 11 passed; `cargo test --locked
+  --lib -- note_name`: 10 passed (the full-queue test needs no editor).
+- `rustfmt --edition 2024 --check` on the four changed files.

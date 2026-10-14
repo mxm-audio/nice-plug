@@ -34,6 +34,10 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info,
     clap_plugin_params,
 };
+// MXM PATCH (note names)
+use clap_sys::ext::note_name::{
+    CLAP_EXT_NOTE_NAME, clap_host_note_name, clap_note_name, clap_plugin_note_name,
+};
 use clap_sys::ext::remote_controls::{
     CLAP_EXT_REMOTE_CONTROLS, clap_plugin_remote_controls, clap_remote_controls_page,
 };
@@ -103,6 +107,8 @@ use crate::wrapper::clap::ClapPlugin;
 use crate::wrapper::clap::context::RemoteControlPages;
 #[cfg(feature = "editor")]
 use crate::wrapper::clap::context::WrapperGuiContext;
+// MXM PATCH (note names)
+use crate::wrapper::clap::note_names::NoteNames;
 use crate::wrapper::clap::util::{read_stream, write_stream};
 use crate::wrapper::state::{self};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
@@ -281,6 +287,12 @@ pub struct Wrapper<P: ClapPlugin> {
 
     clap_plugin_note_ports: clap_plugin_note_ports,
 
+    // MXM PATCH (note names): the extension, offered only when the plugin names its notes; the
+    // host's side, queried in `init`; and what the names are and whether the host must be told.
+    clap_plugin_note_name: clap_plugin_note_name,
+    host_note_name: AtomicRefCell<Option<ClapPtr<clap_host_note_name>>>,
+    note_names: Option<NoteNames>,
+
     clap_plugin_params: clap_plugin_params,
     host_params: AtomicRefCell<Option<ClapPtr<clap_host_params>>>,
     // These fields are exactly the same as their VST3 wrapper counterparts.
@@ -385,6 +397,8 @@ pub enum Task<P: Plugin> {
     LatencyChanged,
     /// Inform the host that the voice info has changed.
     VoiceInfoChanged,
+    /// MXM PATCH (note names): read the note names again, and tell the host if they changed.
+    NoteNamesChanged,
     /// Tell the host that it should rescan the current parameter values.
     // MXM PATCH (defects 3 and 8, refreshed onto 0.4.2): upstream's only sender was the
     // audio-thread GUI-state handoff that defect 8 removes, and defect 3's rescan now rides on
@@ -506,6 +520,10 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                     crate::nice_debug_assert!(is_gui_thread);
                     unsafe_clap_call! { host_params=>rescan(&*self.host_callback, CLAP_PARAM_RESCAN_VALUES) };
                 }
+
+                // MXM PATCH (note names): a host state load and a full GUI transaction both come
+                // here; either may rename a note.
+                self.note_names_touched();
             }
             #[cfg(feature = "editor")]
             Task::ParameterModulationChanged(param_hash, modulation_offset) => {
@@ -552,6 +570,8 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                     crate::nice_warn!("Host does not support the voice-info extension");
                 }
             },
+            // MXM PATCH (note names)
+            Task::NoteNamesChanged => self.check_note_names(),
             Task::RescanParamValues => match &*self.host_params.borrow() {
                 Some(host_params) => {
                     crate::nice_debug_assert!(is_gui_thread);
@@ -818,6 +838,12 @@ impl<P: ClapPlugin> Wrapper<P> {
             &param_ptr_to_hash,
         );
 
+        // MXM PATCH (note names): asked once, as the remote control pages are, so serving them
+        // never takes the plugin's lock.
+        let note_names = plugin
+            .note_names()
+            .map(|source| NoteNames::new(source, &param_id_to_hash));
+
         let wrapper = Self {
             this: AtomicRefCell::new(Weak::new()),
 
@@ -945,6 +971,14 @@ impl<P: ClapPlugin> Wrapper<P> {
             output_parameter_events: ArrayQueue::new(output_parameter_event_capacity),
 
             host_thread_check: AtomicRefCell::new(None),
+
+            // MXM PATCH (note names)
+            clap_plugin_note_name: clap_plugin_note_name {
+                count: Some(Self::ext_note_name_count),
+                get: Some(Self::ext_note_name_get),
+            },
+            host_note_name: AtomicRefCell::new(None),
+            note_names,
 
             clap_plugin_remote_controls: clap_plugin_remote_controls {
                 count: Some(Self::ext_remote_controls_count),
@@ -1154,6 +1188,16 @@ impl<P: ClapPlugin> Wrapper<P> {
                         if unsafe { param_ptr._internal_set_normalized_value(normalized_value) } {
                             if let Some(sample_rate) = sample_rate {
                                 unsafe { param_ptr._internal_update_smoother(sample_rate, false) };
+                            }
+
+                            // MXM PATCH (note names): on the audio thread too; it only raises a
+                            // flag and posts a task.
+                            if self
+                                .note_names
+                                .as_ref()
+                                .is_some_and(|names| names.depends_on(hash))
+                            {
+                                self.note_names_touched();
                             }
 
                             #[cfg(feature = "editor")]
@@ -1824,6 +1868,38 @@ impl<P: ClapPlugin> Wrapper<P> {
                 unsafe_clap_call! { host_state=>mark_dirty(&*self.host_callback) };
             }
         }
+
+        // MXM PATCH (note names): the dirty-only form skips `set_state_inner()`, and so the
+        // `StateChanged` that reads the names again; a persistent field it published may name a
+        // note.
+        self.note_names_touched();
+    }
+
+    /// MXM PATCH (note names): something that may rename a note changed, on any thread. Raises the
+    /// flag and posts the check. If the task queue is full the flag stays raised and the host is
+    /// asked for a main-thread callback, where `on_main_thread()` checks it, so the change is still
+    /// told.
+    fn note_names_touched(&self) {
+        let Some(names) = &self.note_names else {
+            return;
+        };
+        if names.raise() && !self.schedule_gui(Task::NoteNamesChanged) {
+            let host = &self.host_callback;
+            unsafe_clap_call! { host=>request_callback(&**host) };
+        }
+    }
+
+    /// MXM PATCH (note names): on the main thread, tells the host if a raised change renamed a
+    /// note.
+    fn check_note_names(&self) {
+        let Some(names) = &self.note_names else {
+            return;
+        };
+        if names.check()
+            && let Some(host_note_name) = &*self.host_note_name.borrow()
+        {
+            unsafe_clap_call! { host_note_name=>changed(&*self.host_callback) };
+        }
     }
 
     pub fn set_latency_samples(&self, samples: u32) {
@@ -2080,6 +2156,13 @@ impl<P: ClapPlugin> Wrapper<P> {
                 &wrapper.host_callback,
                 CLAP_EXT_VOICE_INFO,
             );
+            // MXM PATCH (note names)
+            if wrapper.note_names.is_some() {
+                *wrapper.host_note_name.borrow_mut() = query_host_extension::<clap_host_note_name>(
+                    &wrapper.host_callback,
+                    CLAP_EXT_NOTE_NAME,
+                );
+            }
             *wrapper.host_thread_check.borrow_mut() = query_host_extension::<clap_host_thread_check>(
                 &wrapper.host_callback,
                 CLAP_EXT_THREAD_CHECK,
@@ -2746,6 +2829,13 @@ impl<P: ClapPlugin> Wrapper<P> {
             } else {
                 std::ptr::null()
             }
+        } else if id == CLAP_EXT_NOTE_NAME {
+            // MXM PATCH (note names): only for a plugin that names its notes.
+            if wrapper.note_names.is_some() {
+                &wrapper.clap_plugin_note_name as *const _ as *const c_void
+            } else {
+                std::ptr::null()
+            }
         } else if id == CLAP_EXT_REMOTE_CONTROLS {
             &wrapper.clap_plugin_remote_controls as *const _ as *const c_void
         } else if id == CLAP_EXT_RENDER {
@@ -2791,6 +2881,9 @@ impl<P: ClapPlugin> Wrapper<P> {
         while let Some(task) = wrapper.tasks.pop() {
             wrapper.execute(task, true);
         }
+
+        // MXM PATCH (note names): a change whose task found the queue full left its flag raised.
+        wrapper.check_note_names();
     }
 
     unsafe extern "C" fn ext_audio_ports_config_count(plugin: *const clap_plugin) -> u32 {
@@ -3773,6 +3866,38 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
+    // MXM PATCH (note names)
+    unsafe extern "C" fn ext_note_name_count(plugin: *const clap_plugin) -> u32 {
+        check_null_ptr!(0, plugin, unsafe { (*plugin).plugin_data });
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+
+        wrapper.note_names.as_ref().map_or(0, NoteNames::count)
+    }
+
+    // MXM PATCH (note names)
+    unsafe extern "C" fn ext_note_name_get(
+        plugin: *const clap_plugin,
+        index: u32,
+        note_name: *mut clap_note_name,
+    ) -> bool {
+        check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data }, note_name);
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+
+        let Some(name) = wrapper
+            .note_names
+            .as_ref()
+            .and_then(|names| names.get(index))
+        else {
+            return false;
+        };
+        let note_name = unsafe { &mut *note_name };
+        strlcpy(&mut note_name.name, &name.name);
+        note_name.port = name.port;
+        note_name.key = name.key;
+        note_name.channel = name.channel;
+        true
+    }
+
     unsafe extern "C" fn ext_remote_controls_count(plugin: *const clap_plugin) -> u32 {
         check_null_ptr!(0, plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
@@ -4357,5 +4482,328 @@ mod mxm_state_tests {
         for channel in [left, right, mono] {
             assert_eq!(channel, [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         }
+    }
+}
+
+// MXM PATCH (note names): the capability through a whole wrapper, with a host that counts what it
+// is told. `note_names.rs` holds the unit tests of the flag and the comparison.
+#[cfg(test)]
+mod mxm_note_name_tests {
+    use super::{ClapParamUpdate, Wrapper};
+    use crate::prelude::*;
+    use clap_sys::ext::note_name::{CLAP_EXT_NOTE_NAME, clap_host_note_name, clap_note_name};
+    use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state};
+    use clap_sys::host::clap_host;
+    use clap_sys::plugin::clap_plugin;
+    use clap_sys::version::CLAP_VERSION;
+    use nice_plug_core::plugin::ParamValue;
+    use std::collections::BTreeMap;
+    use std::ffi::{CStr, c_char, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Probe {
+        changed: AtomicUsize,
+        dirty: AtomicUsize,
+        callbacks: AtomicUsize,
+    }
+
+    fn probe<'a>(host: *const clap_host) -> &'a Probe {
+        unsafe { &*((*host).host_data as *const Probe) }
+    }
+
+    unsafe extern "C" fn note_names_changed(host: *const clap_host) {
+        probe(host).changed.fetch_add(1, Ordering::AcqRel);
+    }
+
+    unsafe extern "C" fn mark_dirty(host: *const clap_host) {
+        probe(host).dirty.fetch_add(1, Ordering::AcqRel);
+    }
+
+    unsafe extern "C" fn request_callback(host: *const clap_host) {
+        probe(host).callbacks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    unsafe extern "C" fn nothing(_host: *const clap_host) {}
+
+    static HOST_NOTE_NAME: clap_host_note_name = clap_host_note_name {
+        changed: Some(note_names_changed),
+    };
+    static HOST_STATE: clap_host_state = clap_host_state {
+        mark_dirty: Some(mark_dirty),
+    };
+
+    unsafe extern "C" fn host_extension(
+        _host: *const clap_host,
+        id: *const c_char,
+    ) -> *const c_void {
+        let id = unsafe { CStr::from_ptr(id) };
+        if id == CLAP_EXT_NOTE_NAME {
+            (&raw const HOST_NOTE_NAME).cast()
+        } else if id == CLAP_EXT_STATE {
+            (&raw const HOST_STATE).cast()
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    fn host(probe: &Probe) -> Box<clap_host> {
+        Box::new(clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: (probe as *const Probe).cast_mut().cast::<c_void>(),
+            name: c"note-name-test".as_ptr(),
+            vendor: c"mxm".as_ptr(),
+            url: c"".as_ptr(),
+            version: c"1".as_ptr(),
+            get_extension: Some(host_extension),
+            request_restart: Some(nothing),
+            request_process: Some(nothing),
+            request_callback: Some(request_callback),
+        })
+    }
+
+    /// Two parameters, one the names depend on, and a label standing for a persistent field the
+    /// editor publishes before it sends the dirty-only transaction.
+    struct TestParams {
+        model: IntParam,
+        level: IntParam,
+        label: Mutex<String>,
+    }
+
+    impl Default for TestParams {
+        fn default() -> Self {
+            Self {
+                model: IntParam::new("Model", 0, IntRange::Linear { min: 0, max: 9 }),
+                level: IntParam::new("Level", 0, IntRange::Linear { min: 0, max: 9 }),
+                label: Mutex::new("bd".to_owned()),
+            }
+        }
+    }
+
+    unsafe impl Params for TestParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            vec![
+                ("model".to_owned(), self.model.as_ptr(), String::new()),
+                ("level".to_owned(), self.level.as_ptr(), String::new()),
+            ]
+        }
+    }
+
+    struct Named(Arc<TestParams>);
+
+    impl ClapNoteNames for Named {
+        fn names(&self) -> Vec<NoteName> {
+            let label = self.0.label.lock().unwrap();
+            vec![NoteName {
+                name: format!("{label}{}", self.0.model.value()),
+                port: 0,
+                key: 36,
+                channel: -1,
+            }]
+        }
+
+        fn depends_on(&self) -> Vec<&'static str> {
+            vec!["model"]
+        }
+    }
+
+    macro_rules! test_plugin {
+        ($name:ident, $id:literal, $names:expr) => {
+            #[derive(Default)]
+            struct $name {
+                params: Arc<TestParams>,
+            }
+
+            impl Plugin for $name {
+                const NAME: &'static str = "Note names";
+                const VENDOR: &'static str = "MXM";
+                const URL: &'static str = "";
+                const EMAIL: &'static str = "";
+                const VERSION: &'static str = "1";
+                const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[];
+                const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
+                type Editor = ();
+                type SysExMessage = ();
+                type BackgroundTask = ();
+
+                fn params(&self) -> Arc<dyn Params> {
+                    self.params.clone()
+                }
+
+                fn process(
+                    &mut self,
+                    _buffer: &mut Buffer,
+                    _aux: &mut AuxiliaryBuffers,
+                    _context: &mut impl ProcessContext<Self>,
+                ) -> ProcessStatus {
+                    ProcessStatus::Normal
+                }
+            }
+
+            impl ClapPlugin for $name {
+                const CLAP_ID: &'static str = $id;
+                const CLAP_DESCRIPTION: Option<&'static str> = None;
+                const CLAP_MANUAL_URL: Option<&'static str> = None;
+                const CLAP_SUPPORT_URL: Option<&'static str> = None;
+                const CLAP_FEATURES: &'static [ClapFeature] = &[];
+
+                fn note_names(&self) -> Option<Arc<dyn ClapNoteNames>> {
+                    let names: fn(&Arc<TestParams>) -> Option<Arc<dyn ClapNoteNames>> = $names;
+                    names(&self.params)
+                }
+            }
+        };
+    }
+
+    test_plugin!(Naming, "dk.mxm.test.naming", |params| Some(Arc::new(
+        Named(params.clone())
+    )));
+    test_plugin!(Silent, "dk.mxm.test.silent", |_| None);
+
+    /// The wrapper, initialized on this thread, which is then its main thread.
+    fn wrapper<P: ClapPlugin>(host: &clap_host) -> Arc<Wrapper<P>> {
+        let wrapper = unsafe { Wrapper::<P>::new(host) };
+        assert!(unsafe { Wrapper::<P>::init(plugin(&wrapper)) });
+        wrapper
+    }
+
+    fn plugin<P: ClapPlugin>(wrapper: &Wrapper<P>) -> *const clap_plugin {
+        wrapper.clap_plugin.as_ptr()
+    }
+
+    fn names<P: ClapPlugin>(wrapper: &Wrapper<P>) -> Vec<(String, i16, i16, i16)> {
+        let plugin = plugin(wrapper);
+        let count = unsafe { Wrapper::<P>::ext_note_name_count(plugin) };
+        (0..count)
+            .map(|index| {
+                let mut name: clap_note_name = unsafe { std::mem::zeroed() };
+                assert!(unsafe { Wrapper::<P>::ext_note_name_get(plugin, index, &mut name) });
+                let text = unsafe { CStr::from_ptr(name.name.as_ptr()) };
+                (
+                    text.to_str().unwrap().to_owned(),
+                    name.port,
+                    name.key,
+                    name.channel,
+                )
+            })
+            .collect()
+    }
+
+    fn set<P: ClapPlugin>(wrapper: &Wrapper<P>, id: &str, value: f64) {
+        let hash = wrapper.param_id_to_hash[id];
+        wrapper.update_plain_value_by_hash(hash, ClapParamUpdate::PlainValueSet(value), None);
+    }
+
+    fn changed(probe: &Probe) -> usize {
+        probe.changed.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn only_a_plugin_that_names_its_notes_offers_the_extension() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let naming = wrapper::<Naming>(&host);
+        let silent = wrapper::<Silent>(&host);
+        let offered = unsafe {
+            Wrapper::<Naming>::get_extension(plugin(&naming), CLAP_EXT_NOTE_NAME.as_ptr())
+        };
+        assert!(!offered.is_null());
+        let offered = unsafe {
+            Wrapper::<Silent>::get_extension(plugin(&silent), CLAP_EXT_NOTE_NAME.as_ptr())
+        };
+        assert!(offered.is_null());
+    }
+
+    #[test]
+    fn the_host_reads_the_names_the_plugin_gives() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let wrapper = wrapper::<Naming>(&host);
+        assert_eq!(names(&wrapper), [("bd0".to_owned(), 0, 36, -1)]);
+    }
+
+    #[test]
+    fn a_parameter_the_names_depend_on_tells_the_host_once_and_no_other_does() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let wrapper = wrapper::<Naming>(&host);
+        set(&wrapper, "level", 4.0);
+        assert_eq!(changed(&probe), 0, "the names don't depend on it");
+        set(&wrapper, "model", 3.0);
+        assert_eq!(changed(&probe), 1);
+        set(&wrapper, "model", 3.0);
+        assert_eq!(changed(&probe), 1, "unchanged, nothing to tell");
+        assert_eq!(names(&wrapper), [("bd3".to_owned(), 0, 36, -1)]);
+    }
+
+    #[test]
+    fn the_dirty_only_gui_transaction_reads_the_names_again() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let wrapper = wrapper::<Naming>(&host);
+        let params = wrapper.plugin.try_lock().unwrap().params.clone();
+        let dirty_only = || PluginState {
+            version: String::new(),
+            params: BTreeMap::new(),
+            fields: params.serialize_fields(),
+        };
+        // Nothing renamed: the host isn't told.
+        wrapper.set_state_object_from_gui(dirty_only());
+        assert_eq!(changed(&probe), 0);
+        // The editor publishes a field, then sends the dirty-only transaction.
+        *params.label.lock().unwrap() = "sn".to_owned();
+        wrapper.set_state_object_from_gui(dirty_only());
+        assert_eq!(changed(&probe), 1);
+        #[cfg(feature = "editor")]
+        assert_eq!(
+            probe.dirty.load(Ordering::Acquire),
+            2,
+            "and the song is dirty"
+        );
+        assert_eq!(names(&wrapper), [("sn0".to_owned(), 0, 36, -1)]);
+    }
+
+    #[test]
+    fn a_state_load_that_renames_a_note_tells_the_host() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let wrapper = wrapper::<Naming>(&host);
+        let mut state = wrapper.get_state_object();
+        state.params.insert("model".to_owned(), ParamValue::I32(5));
+        wrapper.set_state_object_from_gui(state);
+        assert_eq!(changed(&probe), 1);
+        assert_eq!(names(&wrapper), [("bd5".to_owned(), 0, 36, -1)]);
+    }
+
+    // With an editor, the parameter's own editor task would also find the queue full, which a
+    // test build asserts against.
+    #[cfg(not(feature = "editor"))]
+    #[test]
+    fn a_change_whose_task_found_the_queue_full_is_told_at_the_next_callback() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let wrapper = wrapper::<Naming>(&host);
+        while wrapper.tasks.push(super::Task::VoiceInfoChanged).is_ok() {}
+
+        // Off the main thread, as automation comes: the task doesn't fit.
+        let address = Arc::as_ptr(&wrapper) as usize;
+        std::thread::spawn(move || {
+            let wrapper = unsafe { &*(address as *const Wrapper<Naming>) };
+            set(wrapper, "model", 2.0);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(changed(&probe), 0, "not told yet");
+        assert_eq!(
+            probe.callbacks.load(Ordering::Acquire),
+            1,
+            "a main-thread callback was asked for"
+        );
+
+        // The host calls back on the main thread: the queue drains, and the change is told with no
+        // further one.
+        unsafe { Wrapper::<Naming>::on_main_thread(plugin(&wrapper)) };
+        assert_eq!(changed(&probe), 1);
     }
 }

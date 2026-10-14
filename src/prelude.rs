@@ -40,7 +40,8 @@ pub use crate::plugin::{Plugin, ProcessStatus, TaskExecutor};
 #[cfg(feature = "editor")]
 pub use crate::plugin::{TrackColor, TrackInfo};
 pub use crate::wrapper::clap::features::ClapFeature;
-pub use crate::wrapper::clap::{ClapPlugin, PolyModulationConfig};
+// MXM PATCH (note names): `ClapNoteNames` and `NoteName`.
+pub use crate::wrapper::clap::{ClapNoteNames, ClapPlugin, NoteName, PolyModulationConfig};
 #[cfg(feature = "vst3")]
 pub use crate::wrapper::vst3::Vst3Plugin;
 #[cfg(feature = "vst3")]
