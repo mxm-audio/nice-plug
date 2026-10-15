@@ -3332,10 +3332,10 @@ impl<P: ClapPlugin> Wrapper<P> {
 
     /// MXM PATCH: refuses when the editor was created as a floating window.
     ///
-    /// baseview's `Window::set_parent` documents a panic for exactly this case -- a window created
-    /// with no parent and `wait_for_parent` false -- and that panic would be inside the host's
-    /// process. Returning `false` is the correct CLAP answer: the host asked for something this
-    /// configuration cannot do.
+    /// A window created with no parent and `wait_for_parent` false can't be embedded: upstream
+    /// baseview panics there, inside the host's process, and the baseview fork makes it transient
+    /// instead (`ext_gui_set_transient`'s path), which is not what this asks. Returning `false` is
+    /// the correct CLAP answer: the host asked for something this configuration cannot do.
     #[cfg(feature = "editor")]
     unsafe extern "C" fn ext_gui_set_parent(
         plugin: *const clap_plugin,
@@ -3575,13 +3575,65 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
+    /// MXM PATCH (*Transient floating windows*): a floating editor's window is made transient for
+    /// the host's, as CLAP means: kept above it, and the window the editor gives the keys back to
+    /// (baseview's `WindowContext::focus_owner`). baseview's MXM patch makes `Window::set_parent`
+    /// on a window opened floating do exactly that, and `EditorHandle::set_parent` reaches it, so
+    /// nice-plug-core needs no `set_transient` of its own. An embedded editor has no use for it.
     #[cfg(feature = "editor")]
     unsafe extern "C" fn ext_gui_set_transient(
-        _plugin: *const clap_plugin,
-        _window: *const clap_sys::ext::gui::clap_window,
+        plugin: *const clap_plugin,
+        window: *const clap_sys::ext::gui::clap_window,
     ) -> bool {
-        // This is only relevant for floating windows
-        false
+        use nice_plug_core::editor::{EditorHandle, ParentWindowHandle};
+        use std::ffi::c_ulong;
+        use std::num::NonZeroIsize;
+
+        check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data }, window);
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+        let window = unsafe { &*window };
+
+        if !wrapper
+            .editor_is_floating
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        let editor_window = wrapper.editor_window.borrow();
+        let Some(editor_window) = editor_window.as_ref() else {
+            return false;
+        };
+        let editor_window = editor_window.get();
+
+        let api = unsafe { CStr::from_ptr(window.api) };
+        let owner = unsafe {
+            if api == clap_sys::ext::gui::CLAP_WINDOW_API_X11 {
+                #[allow(clippy::unnecessary_cast)]
+                let w = window.specific.x11 as c_ulong;
+                ParentWindowHandle::XlibWindow(w)
+            } else if api == clap_sys::ext::gui::CLAP_WINDOW_API_COCOA {
+                check_null_ptr!(false, window.specific.cocoa);
+                let w = NonNull::new(window.specific.cocoa).unwrap();
+                ParentWindowHandle::AppKitNsView(w)
+            } else if api == clap_sys::ext::gui::CLAP_WINDOW_API_WIN32 {
+                check_null_ptr!(false, window.specific.win32);
+                let w = NonZeroIsize::new(window.specific.win32 as isize).unwrap();
+                ParentWindowHandle::Win32Hwnd(w)
+            } else {
+                return false;
+            }
+        };
+
+        match editor_window
+            .handle
+            .set_parent(owner, editor_window.window.borrow())
+        {
+            Ok(()) => true,
+            Err(e) => {
+                crate::nice_error!("Failed to make the editor window transient: {}", e);
+                false
+            }
+        }
     }
 
     #[cfg(feature = "editor")]

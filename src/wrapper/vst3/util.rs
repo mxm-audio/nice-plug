@@ -65,7 +65,10 @@ pub unsafe fn fid_matches(type_: FIDString, expected: FIDString) -> bool {
     unsafe { !type_.is_null() && CStr::from_ptr(type_) == CStr::from_ptr(expected) }
 }
 
+// MXM PATCH (lint): upstream's casts to `*const u16` are of `char16`, which is `u16`; Clippy 1.98
+// refuses them under `-D warnings`. Test code only.
 #[cfg(test)]
+#[allow(clippy::unnecessary_cast)]
 mod miri {
     use widestring::U16CStr;
 

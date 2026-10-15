@@ -3,7 +3,8 @@
 **Since 2026-10-06 this is `nice-plug 0.4.2` exactly as published on crates.io**, plus the MXM
 patches that 0.4.2 has not made redundant: seven of the eleven numbered fixes (1, 2, 7, 8, 9, 10 and
 11; 1, 2 and 8 reworked for 0.4.2) and four capability changes, the fourth (note names) added on
-2026-10-14. Fixes 3, 4, 5 and 6 were dropped because 0.4.2 does the same thing. The numbering is unchanged, so every older reference
+2026-10-14, floating windows' `set_transient` on 2026-10-15; and one lint, an `allow` on upstream's
+`vst3` test casts that Clippy 1.98 refuses (`MXM PATCH (lint)`). Fixes 3, 4, 5 and 6 were dropped because 0.4.2 does the same thing. The numbering is unchanged, so every older reference
 still resolves. See [*Refresh to 0.4.2*](#refresh-to-042--2026-10-06) for the per-patch status.
 
 *Before the refresh (superseded):* This is **`nice-plug 0.3.0` exactly as published on crates.io**,
@@ -640,8 +641,9 @@ later through `set_parent`. Floating simply stops waiting for one.
 |---|---|
 | `ext_gui_is_api_supported` | Accept `is_floating`. The API check below it is untouched, so floating is accepted for exactly the platform APIs embedding is |
 | `ext_gui_create` | `spawn(None, !is_floating, …)` — `wait_for_parent` is what defers window creation until `set_parent`, and a floating editor has no `set_parent` to wait for |
-| `ext_gui_set_parent` | **Refuse when floating.** baseview's `Window::set_parent` documents a panic for a window created with no parent and `wait_for_parent` false — exactly this configuration — and that panic would be in the host's process |
+| `ext_gui_set_parent` | **Refuse when floating.** A window created with no parent and `wait_for_parent` false — exactly this configuration — can't be embedded: upstream baseview panics there, in the host's process, and the baseview fork makes it transient instead, which is `set_transient`'s job, not this one's |
 | `Wrapper::editor_is_floating` | One field, because `create` and `set_parent` are separate host calls and `SpawnedEditor` records no creation mode. Refusing *every* reparent instead would break embedded hosting in every DAW that uses it today |
+| `ext_gui_set_transient` | Calls `set_parent` on a floating editor, which the baseview fork makes transient (below) |
 | `ClapHostCallbacks::request_resize` | Capture `is_floating` during creation and return success locally for floating windows. CLAP's callback asks for a parent's client area; baseview already resized this parentless window. Embedded editors still forward the request, including host refusals |
 
 *0.4.2 refresh, ported.* 0.4.2 still refuses every floating configuration, in the same functions.
@@ -660,10 +662,15 @@ unchanged: `Editor::spawn` keeps its `wait_for_parent` argument in 0.4.2.
 player asks for floating explicitly. Changing it would tell third-party X11 hosts to stop embedding
 mxm-mono-01 to fix a problem those hosts do not have.
 
-**`ext_gui_set_transient` and `ext_gui_suggest_title` remain stubs.** Implementing them needs a
-`set_owner` in `baseview` and a `set_transient` on `nice-plug-core`'s `EditorHandle` — three crates
-that are not vendored here. The player works around the first from its own side
-(`apps/mxm-player/src/ownership.rs`); the proper fix belongs upstream.
+**`ext_gui_set_transient` makes a floating editor's window transient for the host's**
+(2026-10-15, newDAWn's keyboard-reach plan, S11): kept above it, and the window an MXM editor gives
+the keys back to when VIEW goes past its edge. `nice-plug-core`'s `EditorHandle` has no
+`set_transient`, but nice-plug-egui's `set_parent` is baseview's `Window::set_parent`, which the
+baseview fork's *Transient for, and the keys given back* turns into exactly that for a window
+opened floating. So `ext_gui_set_transient` converts the `clap_window` as `ext_gui_set_parent`
+does and calls `set_parent`, for a floating editor only; an embedded one answers `false`. The
+`set_parent` refusal above is unchanged: a host can't reach the transient path through it.
+**`ext_gui_suggest_title` remains a stub.**
 
 **Regression tests:** `apps/mxm-player/tests/t7_editor.rs::mxm_mono_01_advertises_a_floating_editor`
 holds the advertisement. `apps/mxm-player/tests/editor_resize.rs` holds the native resize path:
