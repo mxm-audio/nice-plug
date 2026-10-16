@@ -84,6 +84,8 @@
 
 pub use nice_plug_core::*;
 
+// MXM PATCH (*Host keys*)
+pub mod host_keys;
 /// Everything you'll need to use nice-plug. Import this with `use nice_plug::prelude::*;`.
 pub mod prelude;
 pub mod wrapper;

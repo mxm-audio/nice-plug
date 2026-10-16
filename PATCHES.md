@@ -3,7 +3,7 @@
 **Since 2026-10-06 this is `nice-plug 0.4.2` exactly as published on crates.io**, plus the MXM
 patches that 0.4.2 has not made redundant: seven of the eleven numbered fixes (1, 2, 7, 8, 9, 10 and
 11; 1, 2 and 8 reworked for 0.4.2) and four capability changes, the fourth (note names) added on
-2026-10-14, floating windows' `set_transient` on 2026-10-15; and one lint, an `allow` on upstream's
+2026-10-14, floating windows' `set_transient` on 2026-10-15, host keys on 2026-10-16; and one lint, an `allow` on upstream's
 `vst3` test casts that Clippy 1.98 refuses (`MXM PATCH (lint)`). Fixes 3, 4, 5 and 6 were dropped because 0.4.2 does the same thing. The numbering is unchanged, so every older reference
 still resolves. See [*Refresh to 0.4.2*](#refresh-to-042--2026-10-06) for the per-patch status.
 
@@ -20,7 +20,8 @@ and the one re-export in `src/wrapper.rs`; the note names add `src/wrapper/clap.
 `src/wrapper/clap/context.rs`. 0.4 removed the wrapper's output queue that the guard bounded.)*
 
 **The four capabilities are different in kind from the eleven** — they are not defect fixes. See
-*GUI-authored state dirty*, *Floating windows*, *GUI-task process wake* and *Note names*, below.
+*GUI-authored state dirty*, *Floating windows*, *GUI-task process wake*, *Note names* and
+*Host keys*, below.
 
 ## Refresh to 0.4.2 — 2026-10-06
 
@@ -747,3 +748,28 @@ key, channel, `-1` meaning any) and `depends_on()` (the parameter IDs the names 
 - `cargo test --locked --lib --no-default-features -- note_name`: 11 passed; `cargo test --locked
   --lib -- note_name`: 10 passed (the full-queue test needs no editor).
 - `rustfmt --edition 2024 --check` on the four changed files.
+
+## Host keys — a capability, not a fix
+
+*Added 2026-10-16.* **Files:** `src/host_keys.rs`, `src/lib.rs`, `src/wrapper/vst3/view.rs`; every
+hunk contains `MXM PATCH (*Host keys*)` or sits in `host_keys.rs`.
+
+A VST3 host may keep a key from the plugin's window and offer it through `IPlugView::onKeyDown`
+instead. Ableton Live 11.3.13 did so with letters (`key = 'a'`, `keyCode = 128 + ('A' - '0')`,
+S = 163, D = 148, F = 150) and Shift with the arrows (measured 2026-10-16), and sent no
+`onKeyUp`. Upstream forwards only VST3's virtual keys, through
+`EditorHandle::on_virtual_key_from_host`, which has no letters, and nice-plug-egui answers it
+`false`, so an MXM editor's S, D and F did nothing in Live.
+
+`nice-plug-core` owns `EditorHandle` and isn't forked, so the channel is a registry here:
+`host_keys::register(parent, receiver)` keys a receiver by the parent window the editor was
+spawned into (`window_key`, every `ParentWindowHandle` variant), for as long as the returned
+`Registration` lives; the latest registration for a window wins. The VST3 view records the window it
+was attached to and offers each `onKeyDown`/`onKeyUp` there first, as a `HostKey` (a virtual key, or
+an uppercase ASCII character from `keyCode >= 128`, or from `key` when `keyCode` is 0), answering
+`kResultTrue` if the receiver takes it and `kResultFalse` if not; with no receiver, upstream's
+virtual-key path runs. Declined keys stay the host's: Live then plays them, or starts its transport.
+nice-plug-egui's fork registers the receiver (its *Host keys*).
+
+**Regression tests:** `host_keys::tests` (registration, latest wins, gone with its handle) and
+`wrapper::vst3::view::host_key_tests` (Live's codes, virtual keys, the keys that are none).

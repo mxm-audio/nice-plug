@@ -12,6 +12,7 @@ use std::num::NonZeroIsize;
 use std::ptr::NonNull;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use vst3::Steinberg::{
@@ -137,6 +138,31 @@ fn vst3_modifiers(raw: i16) -> Modifiers {
     Modifiers::from_bits_truncate(((raw as u32) & 0x0F) as u8)
 }
 
+/// The first VST3 key code that is a character (`VKEY_FIRST_ASCII` in the SDK's `keycodes.h`).
+const VKEY_FIRST_ASCII: i16 = 128;
+
+/// MXM PATCH (*Host keys*): the key a VST3 host's `onKeyDown`/`onKeyUp` reports, as
+/// [`HostKey`](crate::host_keys::HostKey). A virtual key code is [`vst3_virtual_key_code`]'s; a
+/// character key is `VKEY_FIRST_ASCII + (character - '0')`, its character uppercase (Ableton Live
+/// 11: `a` as 145), or, from a host that leaves the code at 0, the `key` character itself.
+fn host_key(key: char16, key_code: i16) -> Option<crate::host_keys::HostKey> {
+    use crate::host_keys::HostKey;
+    if (VKEY_FIRST_CODE..=VKEY_LAST_CODE).contains(&key_code) {
+        return vst3_virtual_key_code(key_code).map(HostKey::Virtual);
+    }
+    let character = if key_code >= VKEY_FIRST_ASCII {
+        char::from_u32((key_code - VKEY_FIRST_ASCII) as u32 + '0' as u32)?
+    } else if key_code == 0 {
+        char::from_u32(key as u32)?
+    } else {
+        return None;
+    };
+    let character = character.to_ascii_uppercase();
+    character
+        .is_ascii_graphic()
+        .then_some(HostKey::Character(character))
+}
+
 // Thanks for putting this behind a platform-specific ifdef...
 // NOTE: This should also be used on the BSDs, which should now be possible since vst3-sys is replaced by the vst3 crate. Because the vst3 crate also exposes these interfaces to other operating systems.
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
@@ -168,6 +194,9 @@ pub(crate) struct WrapperView<P: Vst3Plugin> {
     /// the sizes communicated to and from the DAW should be scaled by this factor since nice-plug's
     /// APIs only deal in logical pixels.
     fallback_scale_factor: AtomicCell<Option<f32>>,
+    /// MXM PATCH (*Host keys*): the window [`IPlugView::attached()`] opened the editor in, as a
+    /// [`crate::host_keys::window_key`], 0 while none: where the keys the host offers go.
+    attached_window: AtomicUsize,
 }
 
 impl<P: Vst3Plugin> Class for WrapperView<P> {
@@ -235,6 +264,7 @@ impl<P: Vst3Plugin> WrapperView<P> {
             #[cfg(all(target_family = "unix", not(target_os = "macos")))]
             run_loop_event_handler: RwLock::new(None),
             fallback_scale_factor: AtomicCell::new(None),
+            attached_window: AtomicUsize::new(0),
         }
     }
 
@@ -307,6 +337,24 @@ impl<P: Vst3Plugin> WrapperView<P> {
     #[cfg(not(target_os = "linux"))]
     pub fn do_maybe_in_run_loop(&self, task: Task<P>) -> Result<(), Task<P>> {
         Err(task)
+    }
+
+    /// MXM PATCH (*Host keys*): a key the host offers through `onKeyDown`/`onKeyUp` goes to the
+    /// receiver the editor registered for its window ([`crate::host_keys`]), characters included,
+    /// and is claimed only if the receiver takes it; with no receiver registered, upstream's
+    /// [`Self::dispatch_virtual_key`]. Ableton Live 11 offers letters and Shift with the arrows
+    /// only this way, so an editor that registers none never sees them there.
+    fn dispatch_key(&self, key: char16, key_code: i16, is_down: bool, modifiers: i16) -> tresult {
+        let window = self.attached_window.load(Ordering::Acquire);
+        if window != 0
+            && let Some(host_key) = host_key(key, key_code)
+            && let Some(taken) =
+                crate::host_keys::offer(window, host_key, is_down, vst3_modifiers(modifiers))
+        {
+            // `kResultOk` is VST3's `kResultTrue`: the key was handled.
+            return if taken { kResultOk } else { kResultFalse };
+        }
+        self.dispatch_virtual_key(key_code, is_down, modifiers)
     }
 
     /// Forward a VST3 `IPlugView::onKey{Down,Up}` event to the editor's
@@ -555,6 +603,7 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
                 });
 
             let fallback_scale_factor = self.fallback_scale_factor.load().map(|s| s as f64);
+            let window_key = crate::host_keys::window_key(&parent_handle);
 
             match self.editor.upgrade().unwrap().lock().spawn(
                 Some(parent_handle),
@@ -570,6 +619,7 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
                     Ok(()) => {
                         *window = Some(Fragile::new(editor_window));
                         inner.is_editor_open.store(true, Ordering::SeqCst);
+                        self.attached_window.store(window_key, Ordering::Release);
                         kResultOk
                     }
                     Err(e) => {
@@ -598,6 +648,7 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
         let mut editor_handle = inner.editor_window.borrow_mut();
         if editor_handle.is_some() {
             inner.is_editor_open.store(false, Ordering::SeqCst);
+            self.attached_window.store(0, Ordering::Release);
             *editor_handle = None;
 
             kResultOk
@@ -615,12 +666,12 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
         kNotImplemented
     }
 
-    unsafe fn onKeyDown(&self, _key: char16, key_code: int16, modifiers: int16) -> tresult {
-        self.dispatch_virtual_key(key_code, true, modifiers)
+    unsafe fn onKeyDown(&self, key: char16, key_code: int16, modifiers: int16) -> tresult {
+        self.dispatch_key(key, key_code, true, modifiers)
     }
 
-    unsafe fn onKeyUp(&self, _key: char16, key_code: int16, modifiers: int16) -> tresult {
-        self.dispatch_virtual_key(key_code, false, modifiers)
+    unsafe fn onKeyUp(&self, key: char16, key_code: int16, modifiers: int16) -> tresult {
+        self.dispatch_key(key, key_code, false, modifiers)
     }
 
     unsafe fn getSize(&self, size: *mut ViewRect) -> tresult {
@@ -886,5 +937,50 @@ impl<P: Vst3Plugin> Drop for RunLoopEventHandler<P> {
             self.run_loop
                 .unregisterEventHandler(self.event_handler_ptr.0.get());
         }
+    }
+}
+
+#[cfg(test)]
+mod host_key_tests {
+    use super::host_key;
+    use crate::editor::VirtualKeyCode;
+    use crate::host_keys::HostKey;
+
+    /// What Ableton Live 11 sent for a, s, d and f (2026-10-16): the character, and
+    /// `VKEY_FIRST_ASCII + (uppercase - '0')`.
+    #[test]
+    fn a_character_key_is_read_from_its_code_as_live_sends_it() {
+        for (key, code, wanted) in [
+            ('a', 145, 'A'),
+            ('s', 163, 'S'),
+            ('d', 148, 'D'),
+            ('f', 150, 'F'),
+        ] {
+            assert_eq!(host_key(key as u16, code), Some(HostKey::Character(wanted)));
+        }
+        // A host that gives only the character.
+        assert_eq!(host_key('e' as u16, 0), Some(HostKey::Character('E')));
+        assert_eq!(host_key(';' as u16, 0), Some(HostKey::Character(';')));
+    }
+
+    /// Live's Shift with the arrows (key code 11 to 14, modifiers 1).
+    #[test]
+    fn a_virtual_key_is_the_virtual_key() {
+        assert_eq!(
+            host_key(0, 11),
+            Some(HostKey::Virtual(VirtualKeyCode::ArrowLeft))
+        );
+        assert_eq!(
+            host_key(0, 6),
+            Some(HostKey::Virtual(VirtualKeyCode::Escape))
+        );
+    }
+
+    #[test]
+    fn nothing_a_key_can_be_named_by_is_no_key() {
+        assert_eq!(host_key(0, 0), None);
+        assert_eq!(host_key(' ' as u16, 0), None);
+        assert_eq!(host_key(0x1b, 0), None);
+        assert_eq!(host_key(0, 100), None);
     }
 }
