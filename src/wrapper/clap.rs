@@ -6,15 +6,23 @@ mod descriptor;
 pub mod features;
 // MXM PATCH (note names): the capability's state, see `ClapPlugin::note_names`.
 mod note_names;
+// MXM PATCH (presets): preset discovery and `preset-load`, see `ClapPlugin::CLAP_PRESETS`.
+pub mod presets;
 mod wrapper;
 
 use crate::wrapper::clap::features::ClapFeature;
+// MXM PATCH (presets)
+pub use self::presets::{ClapPresetLoader, ClapPresets, PresetMetadata};
 
 /// Re-export for the macro
 pub use self::descriptor::PluginDescriptor;
 pub use self::wrapper::Wrapper;
 pub use clap_sys::entry::clap_plugin_entry;
 pub use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
+// MXM PATCH (presets): for the macro.
+pub use clap_sys::factory::preset_discovery::{
+    CLAP_PRESET_DISCOVERY_FACTORY_ID, CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT,
+};
 pub use clap_sys::host::clap_host;
 pub use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 pub use clap_sys::version::CLAP_VERSION;
@@ -60,6 +68,26 @@ pub trait ClapPlugin: Plugin {
     /// parameter the source [depends on][ClapNoteNames::depends_on()] changes, after any state
     /// load, and after any GUI state transaction, the dirty-only form included.
     fn note_names(&self) -> Option<Arc<dyn ClapNoteNames>> {
+        None
+    }
+
+    // MXM PATCH (presets): a capability, not a fix. See `PATCHES.md`, *Presets*.
+    /// How this plugin's preset files are found and read, for a host's index through CLAP's
+    /// [preset discovery](https://github.com/free-audio/clap/blob/main/include/clap/factory/preset-discovery.h).
+    /// `None`, the default, offers no preset-discovery factory. Read without an instance: a
+    /// host indexes presets without creating the plugin.
+    const CLAP_PRESETS: Option<ClapPresets> = None;
+
+    // MXM PATCH (presets): a capability, not a fix. See `PATCHES.md`, *Presets*.
+    /// What loads a preset file for a host, through CLAP's
+    /// [`preset-load`](https://github.com/free-audio/clap/blob/main/include/clap/ext/preset-load.h).
+    /// `None`, the default, offers no extension; it needs the `editor` feature, whose context the
+    /// loader's parameter writes go through.
+    ///
+    /// Called once, while the wrapper is built, as [`note_names()`][Self::note_names()] is, so the
+    /// loader works on shared state (the parameters), never on the plugin itself: a load never
+    /// takes the plugin's lock, which the audio thread may hold.
+    fn preset_loader(&self) -> Option<Arc<dyn ClapPresetLoader>> {
         None
     }
 }
@@ -204,8 +232,19 @@ macro_rules! nice_export_clap {
             pub extern "C" fn deinit() {}
 
             pub extern "C" fn get_factory(factory_id: *const c_char) -> *const c_void {
-                if !factory_id.is_null() && unsafe { CStr::from_ptr(factory_id) } == CLAP_PLUGIN_FACTORY_ID {
+                if factory_id.is_null() {
+                    return ::std::ptr::null();
+                }
+                let factory_id = unsafe { CStr::from_ptr(factory_id) };
+                if factory_id == CLAP_PLUGIN_FACTORY_ID {
                     &CLAP_PLUGIN_FACTORY as *const _ as *const c_void
+                } else if factory_id == $crate::wrapper::clap::CLAP_PRESET_DISCOVERY_FACTORY_ID
+                    || factory_id == $crate::wrapper::clap::CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT
+                {
+                    // MXM PATCH (presets): one provider for each plugin with presets.
+                    $crate::wrapper::clap::presets::factory(|| {
+                        vec![$($crate::wrapper::clap::presets::PresetProvider::for_plugin::<$plugin_ty>()),+]
+                    })
                 } else {
                     ::std::ptr::null()
                 }

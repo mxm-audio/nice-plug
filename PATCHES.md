@@ -773,3 +773,38 @@ nice-plug-egui's fork registers the receiver (its *Host keys*).
 
 **Regression tests:** `host_keys::tests` (registration, latest wins, gone with its handle) and
 `wrapper::vst3::view::host_key_tests` (Live's codes, virtual keys, the keys that are none).
+
+## Presets — a capability, not a fix
+
+The MXM collection's factory presets are files installed with each plugin (the owner, 2026-10-27:
+"The presets should not be compiled into the plugins. It should be external files"), and a host
+lists and loads them through CLAP: `ops/plans/plan-external-presets.md` in the workspace.
+Upstream offers neither CLAP's preset discovery nor `preset-load`.
+
+- **Where the plugin was loaded from** (`wrapper::location`, in the prelude): `plugin_location()`
+  reads the module holding its own code from the system (`GetModuleHandleExW` and
+  `GetModuleFileNameW` on Windows, `dladdr` elsewhere, so `libc` is now a macOS dependency too)
+  and returns the outermost `.clap` or `.vst3` around it, with its format; `None` outside a bundle,
+  as in a unit test. Both formats, every platform, without the entry point's path.
+- **`ClapPlugin::CLAP_PRESETS`**, `None` by default: a preset file's extension, the factory folder
+  and a metadata reader, all without an instance. With it, `get_factory` answers
+  `CLAP_PRESET_DISCOVERY_FACTORY_ID` (and its draft id) with one provider per such plugin
+  (`wrapper::clap::presets`): it declares the file type, then the factory folder as a `FILE`
+  location flagged factory content, or nothing when the folder isn't installed; for each file it
+  reads the name, the plugin id (`clap` ABI) and the category (extra information `category`),
+  passes over another plugin's file, and says why it can't read a broken one. A file is factory
+  content only when it lies directly inside the resolved folder (`presets::in_folder`), never by
+  what it says.
+- **`ClapPlugin::preset_loader()`**, `None` by default, asked once while the wrapper is built, as
+  `note_names()` is, so a load never takes the plugin's lock: a `ClapPresetLoader` that loads a
+  file through a `ParamSetter`. With it, and the `editor` feature whose context the writes go
+  through, the wrapper offers `CLAP_EXT_PRESET_LOAD` (and the draft id): `from_location` takes a
+  `FILE` location on the main thread, loads it through a fresh GUI context, so the parameter
+  writes are the gestures a host sees and the wrapper asks the host to flush them, then tells the
+  host `loaded`, or `on_error` with the loader's reason, and logs a refusal.
+
+**Regression tests:** `wrapper::location::tests` (a CLAP file, a module inside a VST3 and a macOS
+CLAP bundle, no bundle) and `wrapper::clap::presets::tests` (the provider's whole exchange through
+a test indexer and receiver; the folder rule with `..`, a subfolder and a missing file).
+`preset-load` itself needs a running plugin: it is held end to end by the MXM plugins and newDAWn's
+tests that load one.

@@ -2,6 +2,8 @@
 //! name of a type that implements `Plugin` to. The macro will handle the rest.
 
 pub mod clap;
+// MXM PATCH (presets): where the plugin was loaded from.
+pub mod location;
 pub(crate) mod state;
 pub(crate) mod util;
 

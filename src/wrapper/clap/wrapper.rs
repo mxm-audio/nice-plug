@@ -38,6 +38,11 @@ use clap_sys::ext::params::{
 use clap_sys::ext::note_name::{
     CLAP_EXT_NOTE_NAME, clap_host_note_name, clap_note_name, clap_plugin_note_name,
 };
+// MXM PATCH (presets)
+use clap_sys::ext::preset_load::{
+    CLAP_EXT_PRESET_LOAD, CLAP_EXT_PRESET_LOAD_COMPAT, clap_host_preset_load,
+    clap_plugin_preset_load,
+};
 use clap_sys::ext::remote_controls::{
     CLAP_EXT_REMOTE_CONTROLS, clap_plugin_remote_controls, clap_remote_controls_page,
 };
@@ -59,6 +64,9 @@ use clap_sys::ext::track_info::{
 use clap_sys::ext::voice_info::{
     CLAP_EXT_VOICE_INFO, CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_host_voice_info,
     clap_plugin_voice_info, clap_voice_info,
+};
+use clap_sys::factory::preset_discovery::{
+    CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_location_kind,
 };
 use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use clap_sys::host::clap_host;
@@ -87,7 +95,7 @@ use parking_lot::Mutex;
 #[cfg(feature = "editor")]
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::mem;
 use std::num::NonZeroU32;
 use std::os::raw::c_char;
@@ -109,6 +117,8 @@ use crate::wrapper::clap::context::RemoteControlPages;
 use crate::wrapper::clap::context::WrapperGuiContext;
 // MXM PATCH (note names)
 use crate::wrapper::clap::note_names::NoteNames;
+// MXM PATCH (presets)
+use crate::wrapper::clap::presets::ClapPresetLoader;
 use crate::wrapper::clap::util::{read_stream, write_stream};
 use crate::wrapper::state::{self};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
@@ -292,6 +302,12 @@ pub struct Wrapper<P: ClapPlugin> {
     clap_plugin_note_name: clap_plugin_note_name,
     host_note_name: AtomicRefCell<Option<ClapPtr<clap_host_note_name>>>,
     note_names: Option<NoteNames>,
+
+    // MXM PATCH (presets): `preset-load`, offered only when the plugin loads preset files; the
+    // host's side, queried in `init`; and the plugin's loader.
+    clap_plugin_preset_load: clap_plugin_preset_load,
+    host_preset_load: AtomicRefCell<Option<ClapPtr<clap_host_preset_load>>>,
+    preset_loader: Option<Arc<dyn ClapPresetLoader>>,
 
     clap_plugin_params: clap_plugin_params,
     host_params: AtomicRefCell<Option<ClapPtr<clap_host_params>>>,
@@ -843,6 +859,9 @@ impl<P: ClapPlugin> Wrapper<P> {
         let note_names = plugin
             .note_names()
             .map(|source| NoteNames::new(source, &param_id_to_hash));
+        // MXM PATCH (presets): asked once, as the note names are, so a load never takes the
+        // plugin's lock.
+        let preset_loader = plugin.preset_loader();
 
         let wrapper = Self {
             this: AtomicRefCell::new(Weak::new()),
@@ -979,6 +998,13 @@ impl<P: ClapPlugin> Wrapper<P> {
             },
             host_note_name: AtomicRefCell::new(None),
             note_names,
+
+            // MXM PATCH (presets)
+            clap_plugin_preset_load: clap_plugin_preset_load {
+                from_location: Some(Self::ext_preset_load_from_location),
+            },
+            host_preset_load: AtomicRefCell::new(None),
+            preset_loader,
 
             clap_plugin_remote_controls: clap_plugin_remote_controls {
                 count: Some(Self::ext_remote_controls_count),
@@ -2163,6 +2189,20 @@ impl<P: ClapPlugin> Wrapper<P> {
                     CLAP_EXT_NOTE_NAME,
                 );
             }
+            // MXM PATCH (presets)
+            if wrapper.preset_loader.is_some() {
+                *wrapper.host_preset_load.borrow_mut() =
+                    query_host_extension::<clap_host_preset_load>(
+                        &wrapper.host_callback,
+                        CLAP_EXT_PRESET_LOAD,
+                    )
+                    .or_else(|| {
+                        query_host_extension::<clap_host_preset_load>(
+                            &wrapper.host_callback,
+                            CLAP_EXT_PRESET_LOAD_COMPAT,
+                        )
+                    });
+            }
             *wrapper.host_thread_check.borrow_mut() = query_host_extension::<clap_host_thread_check>(
                 &wrapper.host_callback,
                 CLAP_EXT_THREAD_CHECK,
@@ -2833,6 +2873,14 @@ impl<P: ClapPlugin> Wrapper<P> {
             // MXM PATCH (note names): only for a plugin that names its notes.
             if wrapper.note_names.is_some() {
                 &wrapper.clap_plugin_note_name as *const _ as *const c_void
+            } else {
+                std::ptr::null()
+            }
+        } else if id == CLAP_EXT_PRESET_LOAD || id == CLAP_EXT_PRESET_LOAD_COMPAT {
+            // MXM PATCH (presets): only for a plugin that loads preset files, through the
+            // editor's context.
+            if cfg!(feature = "editor") && wrapper.preset_loader.is_some() {
+                &wrapper.clap_plugin_preset_load as *const _ as *const c_void
             } else {
                 std::ptr::null()
             }
@@ -3919,6 +3967,79 @@ impl<P: ClapPlugin> Wrapper<P> {
     }
 
     // MXM PATCH (note names)
+    // MXM PATCH (presets): a host loads one of the plugin's preset files, on the main thread,
+    // and hears whether it was, and why not.
+    unsafe extern "C" fn ext_preset_load_from_location(
+        plugin: *const clap_plugin,
+        location_kind: clap_preset_discovery_location_kind,
+        location: *const c_char,
+        load_key: *const c_char,
+    ) -> bool {
+        check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data });
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+        let loaded = wrapper.load_preset_file(location_kind, location);
+        if let Some(host_preset_load) = &*wrapper.host_preset_load.borrow() {
+            match &loaded {
+                Ok(()) => unsafe_clap_call! {
+                    host_preset_load=>loaded(&*wrapper.host_callback, location_kind, location, load_key)
+                },
+                Err(why) => {
+                    let message = CString::new(why.replace('\0', " ")).unwrap_or_default();
+                    unsafe_clap_call! {
+                        host_preset_load=>on_error(
+                            &*wrapper.host_callback,
+                            location_kind,
+                            location,
+                            load_key,
+                            0,
+                            message.as_ptr()
+                        )
+                    }
+                }
+            }
+        }
+        if let Err(why) = &loaded {
+            crate::nice_warn!("A preset wasn't loaded: {why}");
+        }
+        loaded.is_ok()
+    }
+
+    // MXM PATCH (presets): the file at `location` through the plugin's loader, its parameter
+    // writes the gestures a host sees, as from the editor.
+    #[cfg(feature = "editor")]
+    fn load_preset_file(
+        &self,
+        location_kind: clap_preset_discovery_location_kind,
+        location: *const c_char,
+    ) -> Result<(), String> {
+        let loader = self
+            .preset_loader
+            .as_ref()
+            .ok_or("this plugin loads no preset files")?;
+        if location_kind != CLAP_PRESET_DISCOVERY_LOCATION_FILE || location.is_null() {
+            return Err("only a preset file can be loaded".to_owned());
+        }
+        let path = unsafe { CStr::from_ptr(location) }
+            .to_str()
+            .map_err(|_| "the preset's path isn't UTF-8".to_owned())?;
+        let this = self
+            .this
+            .borrow()
+            .upgrade()
+            .ok_or("the plugin is going away")?;
+        let context = this.make_gui_context();
+        loader.load(std::path::Path::new(path), &context.param_setter())
+    }
+
+    #[cfg(not(feature = "editor"))]
+    fn load_preset_file(
+        &self,
+        _location_kind: clap_preset_discovery_location_kind,
+        _location: *const c_char,
+    ) -> Result<(), String> {
+        Err("this plugin loads no preset files".to_owned())
+    }
+
     unsafe extern "C" fn ext_note_name_count(plugin: *const clap_plugin) -> u32 {
         check_null_ptr!(0, plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
