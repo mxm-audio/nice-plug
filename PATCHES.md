@@ -2,8 +2,8 @@
 
 **Since 2026-10-06 this is `nice-plug 0.4.2` exactly as published on crates.io**, plus the MXM
 patches that 0.4.2 has not made redundant: seven of the eleven numbered fixes (1, 2, 7, 8, 9, 10 and
-11; 1, 2 and 8 reworked for 0.4.2) and four capability changes, the fourth (note names) added on
-2026-10-14, floating windows' `set_transient` on 2026-10-15, host keys on 2026-10-16; and one lint, an `allow` on upstream's
+11; 1, 2 and 8 reworked for 0.4.2) and the capability changes: note names on 2026-10-14, floating
+windows' `set_transient` on 2026-10-15, host keys on 2026-10-16, presets on 2026-10-27; and one lint, an `allow` on upstream's
 `vst3` test casts that Clippy 1.98 refuses (`MXM PATCH (lint)`). Fixes 3, 4, 5 and 6 were dropped because 0.4.2 does the same thing. The numbering is unchanged, so every older reference
 still resolves. See [*Refresh to 0.4.2*](#refresh-to-042--2026-10-06) for the per-patch status.
 
@@ -14,7 +14,9 @@ root `Cargo.toml`.
 Every change is marked `MXM PATCH` in the source, so `grep -rn "MXM PATCH" src/` finds the complete
 delta. Since the 0.4.2 refresh it lives in `src/wrapper/clap/wrapper.rs`, `src/wrapper/state.rs`
 and the one re-export in `src/wrapper.rs`; the note names add `src/wrapper/clap.rs`,
-`src/wrapper/clap/note_names.rs` and `src/prelude.rs`. Hunks reworked by the refresh say
+`src/wrapper/clap/note_names.rs` and `src/prelude.rs`; the presets add `src/wrapper/location.rs`,
+`src/wrapper/clap/presets.rs` and a `libc` dependency on macOS (`Cargo.toml` and
+`Cargo.toml.orig`). Hunks reworked by the refresh say
 `refreshed onto 0.4.2` in their marker. *(0.3.0, superseded: it lived in
 `src/wrapper/clap/wrapper.rs` and `src/wrapper/state.rs`, plus the output-push guard in
 `src/wrapper/clap/context.rs`. 0.4 removed the wrapper's output queue that the guard bounded.)*
@@ -795,16 +797,20 @@ Upstream offers neither CLAP's preset discovery nor `preset-load`.
   passes over another plugin's file, and says why it can't read a broken one. A file is factory
   content only when it lies directly inside the resolved folder (`presets::in_folder`), never by
   what it says.
-- **`ClapPlugin::preset_loader()`**, `None` by default, asked once while the wrapper is built, as
-  `note_names()` is, so a load never takes the plugin's lock: a `ClapPresetLoader` that loads a
-  file through a `ParamSetter`. With it, and the `editor` feature whose context the writes go
-  through, the wrapper offers `CLAP_EXT_PRESET_LOAD` (and the draft id): `from_location` takes a
+- **`ClapPlugin::preset_loader()`**, `None` by default and only with the `editor` feature, whose
+  context the writes go through (the trait, the hook and the wrapper's state are all behind it;
+  discovery isn't), asked once while the wrapper is built, as `note_names()` is, so a load never
+  takes the plugin's lock: a `ClapPresetLoader` that loads a file through a `ParamSetter`. With
+  it the wrapper offers `CLAP_EXT_PRESET_LOAD` (and the draft id): `from_location` takes a
   `FILE` location on the main thread, loads it through a fresh GUI context, so the parameter
   writes are the gestures a host sees and the wrapper asks the host to flush them, then tells the
   host `loaded`, or `on_error` with the loader's reason, and logs a refusal.
 
 **Regression tests:** `wrapper::location::tests` (a CLAP file, a module inside a VST3 and a macOS
-CLAP bundle, no bundle) and `wrapper::clap::presets::tests` (the provider's whole exchange through
-a test indexer and receiver; the folder rule with `..`, a subfolder and a missing file).
-`preset-load` itself needs a running plugin: it is held end to end by the MXM plugins and newDAWn's
-tests that load one.
+CLAP bundle, no bundle), `wrapper::clap::presets::tests` (the provider's whole exchange through a
+test indexer and receiver; the folder rule with `..`, a subfolder and a missing file) and
+`mxm_preset_load_tests` (only a plugin with a loader offers the extension; a load reaches the
+loader and the host hears `loaded`; a refusal and a location that isn't a file reach the host's
+`on_error` with why). `cargo check --no-default-features` fails on `src/host_keys.rs`, which
+predates this patch (the *Host keys* capability imports the editor module unconditionally); the
+presets patch builds with and without `editor`.

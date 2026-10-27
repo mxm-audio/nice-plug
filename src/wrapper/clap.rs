@@ -12,7 +12,9 @@ mod wrapper;
 
 use crate::wrapper::clap::features::ClapFeature;
 // MXM PATCH (presets)
-pub use self::presets::{ClapPresetLoader, ClapPresets, PresetMetadata};
+#[cfg(feature = "editor")]
+pub use self::presets::ClapPresetLoader;
+pub use self::presets::{ClapPresets, PresetMetadata};
 
 /// Re-export for the macro
 pub use self::descriptor::PluginDescriptor;
@@ -81,12 +83,13 @@ pub trait ClapPlugin: Plugin {
     // MXM PATCH (presets): a capability, not a fix. See `PATCHES.md`, *Presets*.
     /// What loads a preset file for a host, through CLAP's
     /// [`preset-load`](https://github.com/free-audio/clap/blob/main/include/clap/ext/preset-load.h).
-    /// `None`, the default, offers no extension; it needs the `editor` feature, whose context the
+    /// `None`, the default, offers no extension. Only with the `editor` feature, whose context the
     /// loader's parameter writes go through.
     ///
     /// Called once, while the wrapper is built, as [`note_names()`][Self::note_names()] is, so the
     /// loader works on shared state (the parameters), never on the plugin itself: a load never
     /// takes the plugin's lock, which the audio thread may hold.
+    #[cfg(feature = "editor")]
     fn preset_loader(&self) -> Option<Arc<dyn ClapPresetLoader>> {
         None
     }

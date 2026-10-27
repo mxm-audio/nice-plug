@@ -15,6 +15,7 @@ use clap_sys::factory::preset_discovery::{
 };
 use clap_sys::universal_plugin_id::clap_universal_plugin_id;
 use clap_sys::version::CLAP_VERSION;
+#[cfg(feature = "editor")]
 use nice_plug_core::context::gui::ParamSetter;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
@@ -41,7 +42,9 @@ pub struct PresetMetadata {
     pub category: Option<String>,
 }
 
-/// Loads a preset file into the plugin, for a host's `preset-load`.
+/// Loads a preset file into the plugin, for a host's `preset-load`. Its writes go through the
+/// editor's context, so it needs the `editor` feature.
+#[cfg(feature = "editor")]
 pub trait ClapPresetLoader: Send + Sync {
     /// Loads `path` through `setter`, on the main thread, as the plugin's own browser would. The
     /// error says why it wasn't loaded.

@@ -38,7 +38,8 @@ use clap_sys::ext::params::{
 use clap_sys::ext::note_name::{
     CLAP_EXT_NOTE_NAME, clap_host_note_name, clap_note_name, clap_plugin_note_name,
 };
-// MXM PATCH (presets)
+// MXM PATCH (presets): `preset-load` goes through the editor's context.
+#[cfg(feature = "editor")]
 use clap_sys::ext::preset_load::{
     CLAP_EXT_PRESET_LOAD, CLAP_EXT_PRESET_LOAD_COMPAT, clap_host_preset_load,
     clap_plugin_preset_load,
@@ -65,6 +66,7 @@ use clap_sys::ext::voice_info::{
     CLAP_EXT_VOICE_INFO, CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_host_voice_info,
     clap_plugin_voice_info, clap_voice_info,
 };
+#[cfg(feature = "editor")]
 use clap_sys::factory::preset_discovery::{
     CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_location_kind,
 };
@@ -95,7 +97,7 @@ use parking_lot::Mutex;
 #[cfg(feature = "editor")]
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{CStr, c_void};
 use std::mem;
 use std::num::NonZeroU32;
 use std::os::raw::c_char;
@@ -118,6 +120,7 @@ use crate::wrapper::clap::context::WrapperGuiContext;
 // MXM PATCH (note names)
 use crate::wrapper::clap::note_names::NoteNames;
 // MXM PATCH (presets)
+#[cfg(feature = "editor")]
 use crate::wrapper::clap::presets::ClapPresetLoader;
 use crate::wrapper::clap::util::{read_stream, write_stream};
 use crate::wrapper::state::{self};
@@ -305,8 +308,11 @@ pub struct Wrapper<P: ClapPlugin> {
 
     // MXM PATCH (presets): `preset-load`, offered only when the plugin loads preset files; the
     // host's side, queried in `init`; and the plugin's loader.
+    #[cfg(feature = "editor")]
     clap_plugin_preset_load: clap_plugin_preset_load,
+    #[cfg(feature = "editor")]
     host_preset_load: AtomicRefCell<Option<ClapPtr<clap_host_preset_load>>>,
+    #[cfg(feature = "editor")]
     preset_loader: Option<Arc<dyn ClapPresetLoader>>,
 
     clap_plugin_params: clap_plugin_params,
@@ -861,6 +867,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             .map(|source| NoteNames::new(source, &param_id_to_hash));
         // MXM PATCH (presets): asked once, as the note names are, so a load never takes the
         // plugin's lock.
+        #[cfg(feature = "editor")]
         let preset_loader = plugin.preset_loader();
 
         let wrapper = Self {
@@ -1000,10 +1007,13 @@ impl<P: ClapPlugin> Wrapper<P> {
             note_names,
 
             // MXM PATCH (presets)
+            #[cfg(feature = "editor")]
             clap_plugin_preset_load: clap_plugin_preset_load {
                 from_location: Some(Self::ext_preset_load_from_location),
             },
+            #[cfg(feature = "editor")]
             host_preset_load: AtomicRefCell::new(None),
+            #[cfg(feature = "editor")]
             preset_loader,
 
             clap_plugin_remote_controls: clap_plugin_remote_controls {
@@ -2190,6 +2200,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 );
             }
             // MXM PATCH (presets)
+            #[cfg(feature = "editor")]
             if wrapper.preset_loader.is_some() {
                 *wrapper.host_preset_load.borrow_mut() =
                     query_host_extension::<clap_host_preset_load>(
@@ -2842,6 +2853,16 @@ impl<P: ClapPlugin> Wrapper<P> {
 
         let id = unsafe { CStr::from_ptr(id) };
 
+        // MXM PATCH (presets): only for a plugin that loads preset files, through the editor's
+        // context.
+        #[cfg(feature = "editor")]
+        if id == CLAP_EXT_PRESET_LOAD || id == CLAP_EXT_PRESET_LOAD_COMPAT {
+            return match wrapper.preset_loader {
+                Some(_) => &wrapper.clap_plugin_preset_load as *const _ as *const c_void,
+                None => std::ptr::null(),
+            };
+        }
+
         if id == CLAP_EXT_PARAMS {
             &wrapper.clap_plugin_params as *const _ as *const c_void
         } else if id == CLAP_EXT_TAIL {
@@ -2873,14 +2894,6 @@ impl<P: ClapPlugin> Wrapper<P> {
             // MXM PATCH (note names): only for a plugin that names its notes.
             if wrapper.note_names.is_some() {
                 &wrapper.clap_plugin_note_name as *const _ as *const c_void
-            } else {
-                std::ptr::null()
-            }
-        } else if id == CLAP_EXT_PRESET_LOAD || id == CLAP_EXT_PRESET_LOAD_COMPAT {
-            // MXM PATCH (presets): only for a plugin that loads preset files, through the
-            // editor's context.
-            if cfg!(feature = "editor") && wrapper.preset_loader.is_some() {
-                &wrapper.clap_plugin_preset_load as *const _ as *const c_void
             } else {
                 std::ptr::null()
             }
@@ -3969,6 +3982,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     // MXM PATCH (note names)
     // MXM PATCH (presets): a host loads one of the plugin's preset files, on the main thread,
     // and hears whether it was, and why not.
+    #[cfg(feature = "editor")]
     unsafe extern "C" fn ext_preset_load_from_location(
         plugin: *const clap_plugin,
         location_kind: clap_preset_discovery_location_kind,
@@ -3984,7 +3998,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                     host_preset_load=>loaded(&*wrapper.host_callback, location_kind, location, load_key)
                 },
                 Err(why) => {
-                    let message = CString::new(why.replace('\0', " ")).unwrap_or_default();
+                    let message =
+                        std::ffi::CString::new(why.replace('\0', " ")).unwrap_or_default();
                     unsafe_clap_call! {
                         host_preset_load=>on_error(
                             &*wrapper.host_callback,
@@ -4029,15 +4044,6 @@ impl<P: ClapPlugin> Wrapper<P> {
             .ok_or("the plugin is going away")?;
         let context = this.make_gui_context();
         loader.load(std::path::Path::new(path), &context.param_setter())
-    }
-
-    #[cfg(not(feature = "editor"))]
-    fn load_preset_file(
-        &self,
-        _location_kind: clap_preset_discovery_location_kind,
-        _location: *const c_char,
-    ) -> Result<(), String> {
-        Err("this plugin loads no preset files".to_owned())
     }
 
     unsafe extern "C" fn ext_note_name_count(plugin: *const clap_plugin) -> u32 {
@@ -4978,5 +4984,243 @@ mod mxm_note_name_tests {
         // further one.
         unsafe { Wrapper::<Naming>::on_main_thread(plugin(&wrapper)) };
         assert_eq!(changed(&probe), 1);
+    }
+}
+
+// MXM PATCH (presets): `preset-load` through the wrapper, against a host that offers its side.
+#[cfg(all(test, feature = "editor"))]
+mod mxm_preset_load_tests {
+    use super::Wrapper;
+    use crate::prelude::*;
+    use clap_sys::ext::preset_load::{CLAP_EXT_PRESET_LOAD, clap_host_preset_load};
+    use clap_sys::factory::preset_discovery::{
+        CLAP_PRESET_DISCOVERY_LOCATION_FILE, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN,
+        clap_preset_discovery_location_kind,
+    };
+    use clap_sys::host::clap_host;
+    use clap_sys::plugin::clap_plugin;
+    use clap_sys::version::CLAP_VERSION;
+    use std::ffi::{CStr, c_char, c_void};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    /// What the host heard, and what the loader was asked.
+    #[derive(Default)]
+    struct Probe {
+        loaded: Mutex<Vec<String>>,
+        errors: Mutex<Vec<String>>,
+    }
+
+    fn probe<'a>(host: *const clap_host) -> &'a Probe {
+        unsafe { &*((*host).host_data as *const Probe) }
+    }
+
+    fn text(pointer: *const c_char) -> String {
+        if pointer.is_null() {
+            return String::new();
+        }
+        unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    unsafe extern "C" fn loaded(
+        host: *const clap_host,
+        _kind: clap_preset_discovery_location_kind,
+        location: *const c_char,
+        _load_key: *const c_char,
+    ) {
+        probe(host).loaded.lock().unwrap().push(text(location));
+    }
+
+    unsafe extern "C" fn on_error(
+        host: *const clap_host,
+        _kind: clap_preset_discovery_location_kind,
+        _location: *const c_char,
+        _load_key: *const c_char,
+        _os_error: i32,
+        message: *const c_char,
+    ) {
+        probe(host).errors.lock().unwrap().push(text(message));
+    }
+
+    static HOST_PRESET_LOAD: clap_host_preset_load = clap_host_preset_load {
+        on_error: Some(on_error),
+        loaded: Some(loaded),
+    };
+
+    unsafe extern "C" fn host_extension(
+        _host: *const clap_host,
+        id: *const c_char,
+    ) -> *const c_void {
+        if unsafe { CStr::from_ptr(id) } == CLAP_EXT_PRESET_LOAD {
+            (&raw const HOST_PRESET_LOAD).cast()
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    unsafe extern "C" fn nothing(_host: *const clap_host) {}
+
+    fn host(probe: &Probe) -> Box<clap_host> {
+        Box::new(clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: (probe as *const Probe).cast_mut().cast::<c_void>(),
+            name: c"preset-load-test".as_ptr(),
+            vendor: c"mxm".as_ptr(),
+            url: c"".as_ptr(),
+            version: c"1".as_ptr(),
+            get_extension: Some(host_extension),
+            request_restart: Some(nothing),
+            request_process: Some(nothing),
+            request_callback: Some(nothing),
+        })
+    }
+
+    #[derive(Default)]
+    struct TestParams {
+        asked: Mutex<Vec<PathBuf>>,
+    }
+
+    unsafe impl Params for TestParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+
+    /// Loads a file named `good.*`, refuses any other, saying why.
+    struct Loader(Arc<TestParams>);
+
+    impl ClapPresetLoader for Loader {
+        fn load(&self, path: &Path, _setter: &ParamSetter) -> Result<(), String> {
+            self.0.asked.lock().unwrap().push(path.to_path_buf());
+            match path.file_stem().and_then(|stem| stem.to_str()) {
+                Some("good") => Ok(()),
+                _ => Err("not one of mine".to_owned()),
+            }
+        }
+    }
+
+    macro_rules! test_plugin {
+        ($name:ident, $id:literal, $loads:expr) => {
+            #[derive(Default)]
+            struct $name {
+                params: Arc<TestParams>,
+            }
+
+            impl Plugin for $name {
+                const NAME: &'static str = "Presets";
+                const VENDOR: &'static str = "MXM";
+                const URL: &'static str = "";
+                const EMAIL: &'static str = "";
+                const VERSION: &'static str = "1";
+                const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[];
+                type Editor = ();
+                type SysExMessage = ();
+                type BackgroundTask = ();
+
+                fn params(&self) -> Arc<dyn Params> {
+                    self.params.clone()
+                }
+
+                fn process(
+                    &mut self,
+                    _buffer: &mut Buffer,
+                    _aux: &mut AuxiliaryBuffers,
+                    _context: &mut impl ProcessContext<Self>,
+                ) -> ProcessStatus {
+                    ProcessStatus::Normal
+                }
+            }
+
+            impl ClapPlugin for $name {
+                const CLAP_ID: &'static str = $id;
+                const CLAP_DESCRIPTION: Option<&'static str> = None;
+                const CLAP_MANUAL_URL: Option<&'static str> = None;
+                const CLAP_SUPPORT_URL: Option<&'static str> = None;
+                const CLAP_FEATURES: &'static [ClapFeature] = &[];
+
+                fn preset_loader(&self) -> Option<Arc<dyn ClapPresetLoader>> {
+                    let loads: fn(&Arc<TestParams>) -> Option<Arc<dyn ClapPresetLoader>> = $loads;
+                    loads(&self.params)
+                }
+            }
+        };
+    }
+
+    test_plugin!(Loading, "dk.mxm.test.loading", |params| Some(Arc::new(
+        Loader(params.clone())
+    )));
+    test_plugin!(Plain, "dk.mxm.test.plain", |_| None);
+
+    fn wrapper<P: ClapPlugin>(host: &clap_host) -> Arc<Wrapper<P>> {
+        let wrapper = unsafe { Wrapper::<P>::new(host) };
+        assert!(unsafe { Wrapper::<P>::init(plugin(&wrapper)) });
+        wrapper
+    }
+
+    fn plugin<P: ClapPlugin>(wrapper: &Wrapper<P>) -> *const clap_plugin {
+        wrapper.clap_plugin.as_ptr()
+    }
+
+    fn load<P: ClapPlugin>(
+        wrapper: &Wrapper<P>,
+        kind: clap_preset_discovery_location_kind,
+        location: &CStr,
+    ) -> bool {
+        unsafe {
+            Wrapper::<P>::ext_preset_load_from_location(
+                plugin(wrapper),
+                kind,
+                location.as_ptr(),
+                std::ptr::null(),
+            )
+        }
+    }
+
+    #[test]
+    fn only_a_plugin_that_loads_presets_offers_the_extension() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let loading = wrapper::<Loading>(&host);
+        let plain = wrapper::<Plain>(&host);
+        let offered = unsafe {
+            Wrapper::<Loading>::get_extension(plugin(&loading), CLAP_EXT_PRESET_LOAD.as_ptr())
+        };
+        assert!(!offered.is_null());
+        let offered = unsafe {
+            Wrapper::<Plain>::get_extension(plugin(&plain), CLAP_EXT_PRESET_LOAD.as_ptr())
+        };
+        assert!(offered.is_null());
+    }
+
+    /// A file the loader takes is loaded and the host told so; one it refuses, and a location
+    /// that isn't a file, are refused, the host told why.
+    #[test]
+    fn a_load_reaches_the_loader_and_the_host_hears_how_it_went() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let wrapper = wrapper::<Loading>(&host);
+
+        assert!(load(
+            &wrapper,
+            CLAP_PRESET_DISCOVERY_LOCATION_FILE,
+            c"presets/good.json"
+        ));
+        assert_eq!(*probe.loaded.lock().unwrap(), ["presets/good.json"]);
+
+        assert!(!load(
+            &wrapper,
+            CLAP_PRESET_DISCOVERY_LOCATION_FILE,
+            c"presets/bad.json"
+        ));
+        assert_eq!(*probe.errors.lock().unwrap(), ["not one of mine"]);
+
+        assert!(!load(&wrapper, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, c""));
+        assert_eq!(
+            probe.errors.lock().unwrap()[1],
+            "only a preset file can be loaded"
+        );
+        assert_eq!(probe.loaded.lock().unwrap().len(), 1, "nothing else loaded");
     }
 }
