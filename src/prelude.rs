@@ -42,11 +42,10 @@ pub use crate::plugin::{TrackColor, TrackInfo};
 pub use crate::wrapper::clap::features::ClapFeature;
 // MXM PATCH (note names): `ClapNoteNames` and `NoteName`.
 pub use crate::wrapper::clap::{ClapNoteNames, ClapPlugin, NoteName, PolyModulationConfig};
-// MXM PATCH (presets): the preset capability, and where the plugin was loaded from.
+// MXM PATCH (presets): the preset capability.
 #[cfg(feature = "editor")]
 pub use crate::wrapper::clap::ClapPresetLoader;
 pub use crate::wrapper::clap::{ClapPresets, PresetMetadata};
-pub use crate::wrapper::location::{PluginFormat, PluginLocation, plugin_location};
 #[cfg(feature = "vst3")]
 pub use crate::wrapper::vst3::Vst3Plugin;
 #[cfg(feature = "vst3")]

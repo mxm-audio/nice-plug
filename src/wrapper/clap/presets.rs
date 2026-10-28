@@ -2,8 +2,8 @@
 //! and loaded through `preset-load`. A capability, not a fix. See `PATCHES.md`, *Presets*.
 //!
 //! The discovery factory needs no plugin instance: each plugin with [`ClapPresets`] gets one
-//! provider, which declares its preset file type and its factory folder, and reads a file's name,
-//! category and plugin for the host's index. Loading goes through the plugin, by
+//! provider, which declares its preset file type and the factory folder of its id and version, and
+//! reads a file's name, category and plugin for the host's index. Loading goes through the plugin, by
 //! [`ClapPresetLoader`], so a preset loads in a host exactly as in the plugin's own browser.
 
 use clap_sys::factory::preset_discovery::{
@@ -27,8 +27,9 @@ use std::sync::OnceLock;
 pub struct ClapPresets {
     /// A preset file's extension, without the dot, such as `json`.
     pub file_extension: &'static str,
-    /// The folder of factory presets installed with the plugin, if there is one.
-    pub factory_folder: fn() -> Option<PathBuf>,
+    /// The folder of factory presets installed for the plugin `clap_id` at `version` (its
+    /// `Plugin::VERSION`), if there is one.
+    pub factory_folder: fn(clap_id: &str, version: &str) -> Option<PathBuf>,
     /// A file's metadata, for the plugin `clap_id`: `Ok(None)` for a file that is another
     /// plugin's or no preset at all, `Err` for one of its own that can't be read.
     pub metadata: fn(path: &Path, clap_id: &str) -> Result<Option<PresetMetadata>, String>,
@@ -64,6 +65,7 @@ pub fn in_folder(path: &Path, folder: &Path) -> bool {
 #[doc(hidden)]
 pub struct PresetProvider {
     clap_id: CString,
+    version: String,
     id: CString,
     name: CString,
     /// Kept for `descriptor.vendor`, which points into it.
@@ -79,10 +81,16 @@ unsafe impl Sync for PresetProvider {}
 impl PresetProvider {
     /// The provider for a plugin with `presets`, or `None` for one without.
     pub fn for_plugin<P: super::ClapPlugin>() -> Option<Self> {
-        Self::new(P::CLAP_ID, P::NAME, P::VENDOR, P::CLAP_PRESETS?)
+        Self::new(P::CLAP_ID, P::VERSION, P::NAME, P::VENDOR, P::CLAP_PRESETS?)
     }
 
-    fn new(clap_id: &str, name: &str, vendor: &str, presets: ClapPresets) -> Option<Self> {
+    fn new(
+        clap_id: &str,
+        version: &str,
+        name: &str,
+        vendor: &str,
+        presets: ClapPresets,
+    ) -> Option<Self> {
         let clap_id = CString::new(clap_id).ok()?;
         let id = CString::new(format!("{}.presets", clap_id.to_str().ok()?)).ok()?;
         let name = CString::new(format!("{name} presets")).ok()?;
@@ -97,12 +105,21 @@ impl PresetProvider {
         };
         Some(Self {
             clap_id,
+            version: version.to_owned(),
             id,
             name,
             _vendor: vendor,
             descriptor,
             presets,
         })
+    }
+}
+
+impl PresetProvider {
+    /// The plugin's factory folder, asked for by its id and version.
+    fn factory_folder(&self) -> Option<PathBuf> {
+        let clap_id = self.clap_id.to_str().ok()?;
+        (self.presets.factory_folder)(clap_id, &self.version)
     }
 }
 
@@ -227,7 +244,7 @@ unsafe extern "C" fn init(provider: *const clap_preset_discovery_provider) -> bo
         return false;
     }
     // A plugin installed without its folder has no factory presets: nothing to declare.
-    let Some(folder) = (presets.factory_folder)().filter(|folder| folder.is_dir()) else {
+    let Some(folder) = this.entry.factory_folder().filter(|folder| folder.is_dir()) else {
         return true;
     };
     let Some(path) = folder.to_str().and_then(|path| CString::new(path).ok()) else {
@@ -303,7 +320,10 @@ unsafe extern "C" fn get_metadata(
         unsafe { add_plugin_id(receiver, &plugin) };
     }
     if let Some(set_flags) = receiver_ref.set_flags {
-        let factory = (presets.factory_folder)().is_some_and(|folder| in_folder(&path, &folder));
+        let factory = this
+            .entry
+            .factory_folder()
+            .is_some_and(|folder| in_folder(&path, &folder));
         let flags = if factory {
             CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT
         } else {
@@ -337,8 +357,11 @@ mod tests {
     /// The test plugin's factory folder; a `fn` can't capture one.
     static FOLDER: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-    fn folder() -> Option<PathBuf> {
-        FOLDER.lock().unwrap().clone()
+    /// The folder, for the test plugin's id and version only.
+    fn folder(clap_id: &str, version: &str) -> Option<PathBuf> {
+        (clap_id == "dk.test.synth" && version == "1.2.3")
+            .then(|| FOLDER.lock().unwrap().clone())
+            .flatten()
     }
 
     /// `name|category|plugin` in a `.txt`.
@@ -502,8 +525,8 @@ mod tests {
         (read, heard)
     }
 
-    /// One test, as the folder is one static: the provider declares the type and the folder,
-    /// reads a preset's metadata, passes over another plugin's file, says why it can't read a
+    /// One test, as the folder is one static: the provider declares the type and the folder of
+    /// its plugin's id and version, reads a preset's metadata, passes over another plugin's file, says why it can't read a
     /// broken one, tells a file outside the folder from a factory one, and declares no folder
     /// when there is none.
     #[test]
@@ -518,7 +541,7 @@ mod tests {
         *FOLDER.lock().unwrap() = Some(factory.clone());
 
         let entry: &'static PresetProvider = Box::leak(Box::new(
-            PresetProvider::new("dk.test.synth", "Synth", "Test", PRESETS).unwrap(),
+            PresetProvider::new("dk.test.synth", "1.2.3", "Synth", "Test", PRESETS).unwrap(),
         ));
         assert_eq!(text(entry.descriptor.id), "dk.test.synth.presets");
 

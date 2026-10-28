@@ -14,9 +14,7 @@ root `Cargo.toml`.
 Every change is marked `MXM PATCH` in the source, so `grep -rn "MXM PATCH" src/` finds the complete
 delta. Since the 0.4.2 refresh it lives in `src/wrapper/clap/wrapper.rs`, `src/wrapper/state.rs`
 and the one re-export in `src/wrapper.rs`; the note names add `src/wrapper/clap.rs`,
-`src/wrapper/clap/note_names.rs` and `src/prelude.rs`; the presets add `src/wrapper/location.rs`,
-`src/wrapper/clap/presets.rs` and a `libc` dependency on macOS (`Cargo.toml` and
-`Cargo.toml.orig`). Hunks reworked by the refresh say
+`src/wrapper/clap/note_names.rs` and `src/prelude.rs`; the presets add `src/wrapper/clap/presets.rs`. Hunks reworked by the refresh say
 `refreshed onto 0.4.2` in their marker. *(0.3.0, superseded: it lived in
 `src/wrapper/clap/wrapper.rs` and `src/wrapper/state.rs`, plus the output-push guard in
 `src/wrapper/clap/context.rs`. 0.4 removed the wrapper's output queue that the guard bounded.)*
@@ -778,18 +776,15 @@ nice-plug-egui's fork registers the receiver (its *Host keys*).
 
 ## Presets — a capability, not a fix
 
-The MXM collection's factory presets are files installed with each plugin (the owner, 2026-10-27:
-"The presets should not be compiled into the plugins. It should be external files"), and a host
-lists and loads them through CLAP: `ops/plans/plan-external-presets.md` in the workspace.
-Upstream offers neither CLAP's preset discovery nor `preset-load`.
+The MXM collection's factory presets are files installed with each plugin version (the owner,
+2026-10-27: "The presets should not be compiled into the plugins. It should be external files"; and
+2026-10-28: in a data folder, one per version), and a host lists and loads them through CLAP:
+`ops/plans/plan-external-presets.md` in the workspace. Upstream offers neither CLAP's preset
+discovery nor `preset-load`.
 
-- **Where the plugin was loaded from** (`wrapper::location`, in the prelude): `plugin_location()`
-  reads the module holding its own code from the system (`GetModuleHandleExW` and
-  `GetModuleFileNameW` on Windows, `dladdr` elsewhere, so `libc` is now a macOS dependency too)
-  and returns the outermost `.clap` or `.vst3` around it, with its format; `None` outside a bundle,
-  as in a unit test. Both formats, every platform, without the entry point's path.
 - **`ClapPlugin::CLAP_PRESETS`**, `None` by default: a preset file's extension, the factory folder
-  and a metadata reader, all without an instance. With it, `get_factory` answers
+  of a plugin by its id and version (`factory_folder(P::CLAP_ID, P::VERSION)`) and a metadata
+  reader, all without an instance. With it, `get_factory` answers
   `CLAP_PRESET_DISCOVERY_FACTORY_ID` (and its draft id) with one provider per such plugin
   (`wrapper::clap::presets`): it declares the file type, then the factory folder as a `FILE`
   location flagged factory content, or nothing when the folder isn't installed; for each file it
@@ -806,9 +801,8 @@ Upstream offers neither CLAP's preset discovery nor `preset-load`.
   writes are the gestures a host sees and the wrapper asks the host to flush them, then tells the
   host `loaded`, or `on_error` with the loader's reason, and logs a refusal.
 
-**Regression tests:** `wrapper::location::tests` (a CLAP file, a module inside a VST3 and a macOS
-CLAP bundle, no bundle), `wrapper::clap::presets::tests` (the provider's whole exchange through a
-test indexer and receiver; the folder rule with `..`, a subfolder and a missing file) and
+**Regression tests:** `wrapper::clap::presets::tests` (the provider's whole exchange through a
+test indexer and receiver, the folder asked for by the plugin's id and version; the folder rule with `..`, a subfolder and a missing file) and
 `mxm_preset_load_tests` (only a plugin with a loader offers the extension; a load reaches the
 loader and the host hears `loaded`; a refusal and a location that isn't a file reach the host's
 `on_error` with why). `cargo check --no-default-features` fails on `src/host_keys.rs`, which
