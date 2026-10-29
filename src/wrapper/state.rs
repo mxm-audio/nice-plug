@@ -215,12 +215,7 @@ pub(crate) unsafe fn serialize_json<'a, P: Plugin>(
     params_iter: impl IntoIterator<Item = (&'a String, ParamPtr)>,
 ) -> Result<Vec<u8>> {
     let plugin_state = unsafe { serialize_object::<P>(plugin_params, params_iter) };
-    encode_json(&plugin_state)
-}
-
-/// A state as [`serialize_json`] writes it: JSON, compressed with the `zstd` feature.
-pub(crate) fn encode_json(plugin_state: &PluginState) -> Result<Vec<u8>> {
-    let json = serde_json::to_vec(plugin_state).context("Could not format as JSON")?;
+    let json = serde_json::to_vec(&plugin_state).context("Could not format as JSON")?;
 
     #[cfg(feature = "zstd")]
     {

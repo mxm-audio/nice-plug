@@ -10,14 +10,14 @@ use nice_plug_core::editor::dpi::Size;
 use nice_plug_core::editor::{Editor, SpawnedEditor};
 use nice_plug_core::midi::{MidiConfig, PluginNoteEvent};
 use nice_plug_core::params::internals::ParamPtr;
-use nice_plug_core::params::{Param, ParamFlags, Params};
+use nice_plug_core::params::{ParamFlags, Params};
 #[cfg(feature = "editor")]
 use nice_plug_core::plugin::TrackInfo;
-use nice_plug_core::plugin::{ParamValue, Plugin, PluginState, ProcessStatus, TaskExecutor};
+use nice_plug_core::plugin::{Plugin, PluginState, ProcessStatus, TaskExecutor};
 use parking_lot::Mutex;
 #[cfg(feature = "editor")]
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -161,10 +161,6 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     pub pending_edits: Vec<AtomicU64>,
     /// Whether a slot of `pending_edits` may be set.
     pub edits_pending: AtomicBool,
-    /// MXM PATCH (suspended processing): the generation a pending edit is made in, read as it is
-    /// made and kept in its slot; a state transaction begins a new one, and supersedes only the
-    /// edits of earlier ones.
-    pub edit_generation: AtomicU32,
     /// Each parameter's place in `param_hashes`.
     pub param_index_by_hash: HashMap<u32, usize>,
 
@@ -395,7 +391,6 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             appliers: AtomicU32::new(0),
             pending_edits,
             edits_pending: AtomicBool::new(false),
-            edit_generation: AtomicU32::new(0),
             param_index_by_hash,
 
             param_hashes,
@@ -677,7 +672,9 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         if !normalized_value.is_finite() {
             return kInvalidArgument;
         }
-        let generation = self.edit_generation.load(Ordering::SeqCst);
+        // The edit's generation is the transaction count it read: one made after a state
+        // transaction began reads that transaction's own (odd) count, the boundary it keeps.
+        let generation = self.state_transactions.load(Ordering::SeqCst) as u32;
         self.pending_edits[index].store(pending(normalized_value, generation), Ordering::SeqCst);
         self.edits_pending.store(true, Ordering::SeqCst);
         self.apply_pending_edits_if_idle();
@@ -745,30 +742,20 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
     }
 
-    /// MXM PATCH (suspended processing): `params`, a state being saved, with each pending edit's
-    /// value in place of its parameter's: an edit the host has been told of (`performEdit`) is
-    /// saved though no block has applied it yet (VST3 review, 2026-10-29).
-    pub fn overlay_pending_edits(&self, params: &mut BTreeMap<String, ParamValue>) {
-        for (slot, hash) in self.pending_edits.iter().zip(&self.param_hashes) {
-            let Some(normalized) = taken(slot.load(Ordering::SeqCst)) else {
-                continue;
-            };
-            let (Some(id), Some(param)) = (
-                self.param_id_by_hash.get(hash),
-                self.param_by_hash.get(hash),
-            ) else {
-                continue;
-            };
-            // SAFETY: the parameters outlive the wrapper, as everywhere `param_by_hash` is read.
-            let value = unsafe {
-                match *param {
-                    ParamPtr::FloatParam(p) => ParamValue::F32((*p).preview_plain(normalized)),
-                    ParamPtr::IntParam(p) => ParamValue::I32((*p).preview_plain(normalized)),
-                    ParamPtr::BoolParam(p) => ParamValue::Bool((*p).preview_plain(normalized)),
-                    ParamPtr::EnumParam(p) => ParamValue::I32((*p).preview_plain(normalized)),
-                }
-            };
-            params.insert(id.clone(), value);
+    /// MXM PATCH (suspended processing): before a save, the pending edits made so far applied to
+    /// the parameters, so the state saved holds every edit the host was told of before it asked,
+    /// saved as any value is (an enum by its stable ID). A running call applies them as it ends,
+    /// this thread when none runs; it waits, off the audio thread, for that call or a state
+    /// transaction on another thread to end, for `SETTLE_WAIT` at most, and the save then goes on
+    /// without them rather than leave the host hanging (VST3 review, 2026-10-29).
+    pub fn settle_pending_edits(&self) {
+        let started = Instant::now();
+        loop {
+            self.apply_pending_edits_if_idle();
+            if !self.edits_pending.load(Ordering::SeqCst) || started.elapsed() > SETTLE_WAIT {
+                return;
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -801,14 +788,10 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         // Made before the lock and dropped after it, as `setActive()` does: dropping it may ask
         // the host for a restart, which a host may answer at once by taking the lock.
         let mut activate_context = self.make_activate_context();
-        self.state_transactions.fetch_add(1, Ordering::SeqCst);
-        // A new edit generation as it begins, before either wait: an edit made from here on is
-        // newer than the state it loads, and stays.
-        let boundary = self
-            .edit_generation
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1)
-            & GENERATION_MASK;
+        // Counted in, which also begins its edit generation, in one step before either wait:
+        // appliers stop, and an edit made from here on reads this count and stays.
+        let boundary =
+            (self.state_transactions.fetch_add(1, Ordering::SeqCst) + 1) as u32 & GENERATION_MASK;
         if !self.appliers_drained() {
             self.finish_state_transaction();
             crate::nice_error!("Failed to load state: an edit was still being applied");
@@ -947,6 +930,9 @@ impl<P: Vst3Plugin> Drop for InProcess<'_, P> {
         Self::apply(self.0);
     }
 }
+
+/// How long [`WrapperInner::settle_pending_edits`] waits for a running call or a transaction.
+const SETTLE_WAIT: Duration = Duration::from_secs(2);
 
 /// The flag marking a pending edit's slot: its value's bits below, its generation above.
 const PENDING: u64 = 1 << 32;

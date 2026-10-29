@@ -852,12 +852,13 @@ the fixes for the state paths already (defect 8, *GUI-authored state dirty*); th
   values are atomics: an edit then lands within the block, as a sample-accurate host change does).
   A state transaction supersedes the edits made before it: counted in first, it waits the appliers
   out (and is refused, touching nothing, if one is still applying after a second), takes the lock,
-  and on success drops the pending edits made before it began. Each edit carries the generation it
-  was made in (`edit_generation`, read as it is made), the transaction begins a new one before
-  either wait, and only older generations are dropped, each by compare-exchange, so an edit made
-  after it began stays, and a refused load drops none. `getState()` saves each pending edit's value
-  in place of its parameter's (`overlay_pending_edits`), so an edit the host was told of is saved
-  though no block has applied it.
+  and on success drops the pending edits made before it began. Each edit carries as its
+  generation the transaction count it read as it was made; counting a transaction in also begins
+  its generation, in one step before either wait, and only other generations are dropped, each by
+  compare-exchange, so an edit made after it began stays, and a refused load drops none.
+  `getState()` first applies the pending edits (`settle_pending_edits`: a running call applies them
+  as it ends, the UI thread when none runs, waiting at most `SETTLE_WAIT`), so an edit the host was
+  told of is saved, as any value is: an enum by its stable ID.
   No edit is applied while it runs (`appliers` against `state_transactions`), and every path out,
   a refusal's too, applies the pending edits if no call runs (`finish_state_transaction`). Upstream's own FIXME named REAPER, which stops processing a bypassed
   plugin. A time-based fallback, tried first, was dropped in review: a past block says nothing about
