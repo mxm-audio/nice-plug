@@ -596,6 +596,10 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     /// the JSON in the relevant plugin API methods instead.
     #[cfg(feature = "editor")]
     pub fn get_state_object(&self) -> PluginState {
+        // MXM PATCH (suspended processing): with the pending edits applied, as `getState()` saves
+        // it, so an editor that sends this back as a full state does not undo them (VST3 review,
+        // 2026-10-29).
+        self.settle_pending_edits();
         unsafe {
             state::serialize_object::<P>(
                 self.params.clone(),
@@ -674,8 +678,23 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
         // The edit's generation is the transaction count it read: one made after a state
         // transaction began reads that transaction's own (odd) count, the boundary it keeps.
-        let generation = self.state_transactions.load(Ordering::SeqCst) as u32;
-        self.pending_edits[index].store(pending(normalized_value, generation), Ordering::SeqCst);
+        // Published by compare-exchange and the count read again after: if it moved, the edit is
+        // published again with the count now, so no slot keeps an edit under a generation older
+        // than the transaction it was stored in, which would let that transaction's success drop
+        // it, or a newer edit it overwrote (VST3 review, 2026-10-29).
+        let slot = &self.pending_edits[index];
+        loop {
+            let generation = self.state_transactions.load(Ordering::SeqCst) as u32;
+            let edit = pending(normalized_value, generation);
+            let current = slot.load(Ordering::SeqCst);
+            if slot
+                .compare_exchange(current, edit, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+                && self.state_transactions.load(Ordering::SeqCst) as u32 == generation
+            {
+                break;
+            }
+        }
         self.edits_pending.store(true, Ordering::SeqCst);
         self.apply_pending_edits_if_idle();
         kResultOk
@@ -752,7 +771,11 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         let started = Instant::now();
         loop {
             self.apply_pending_edits_if_idle();
-            if !self.edits_pending.load(Ordering::SeqCst) || started.elapsed() > SETTLE_WAIT {
+            // The flag first, then the appliers: an applier clears the flag before it writes, so
+            // one caught between the two is still counted, and the save waits for its write.
+            let settled = !self.edits_pending.load(Ordering::SeqCst)
+                && self.appliers.load(Ordering::SeqCst) == 0;
+            if settled || started.elapsed() > SETTLE_WAIT {
                 return;
             }
             std::thread::yield_now();

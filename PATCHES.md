@@ -856,9 +856,12 @@ the fixes for the state paths already (defect 8, *GUI-authored state dirty*); th
   generation the transaction count it read as it was made; counting a transaction in also begins
   its generation, in one step before either wait, and only other generations are dropped, each by
   compare-exchange, so an edit made after it began stays, and a refused load drops none.
-  `getState()` first applies the pending edits (`settle_pending_edits`: a running call applies them
-  as it ends, the UI thread when none runs, waiting at most `SETTLE_WAIT`), so an edit the host was
-  told of is saved, as any value is: an enum by its stable ID.
+  An edit is published by compare-exchange and the count read again after; if it moved, it is
+  published again under the count now, so no slot keeps an edit under a generation older than the
+  transaction it was stored in. `getState()` and the editor's `get_state()` first apply the pending
+  edits (`settle_pending_edits`: a running call applies them as it ends, the UI thread when none
+  runs; settled once the flag is clear and then no applier runs, waiting at most `SETTLE_WAIT`), so
+  an edit the host was told of is saved, as any value is: an enum by its stable ID.
   No edit is applied while it runs (`appliers` against `state_transactions`), and every path out,
   a refusal's too, applies the pending edits if no call runs (`finish_state_transaction`). Upstream's own FIXME named REAPER, which stops processing a bypassed
   plugin. A time-based fallback, tried first, was dropped in review: a past block says nothing about
