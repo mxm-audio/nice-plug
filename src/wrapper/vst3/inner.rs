@@ -10,14 +10,14 @@ use nice_plug_core::editor::dpi::Size;
 use nice_plug_core::editor::{Editor, SpawnedEditor};
 use nice_plug_core::midi::{MidiConfig, PluginNoteEvent};
 use nice_plug_core::params::internals::ParamPtr;
-use nice_plug_core::params::{ParamFlags, Params};
+use nice_plug_core::params::{Param, ParamFlags, Params};
 #[cfg(feature = "editor")]
 use nice_plug_core::plugin::TrackInfo;
-use nice_plug_core::plugin::{Plugin, PluginState, ProcessStatus, TaskExecutor};
+use nice_plug_core::plugin::{ParamValue, Plugin, PluginState, ProcessStatus, TaskExecutor};
 use parking_lot::Mutex;
 #[cfg(feature = "editor")]
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -161,6 +161,10 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     pub pending_edits: Vec<AtomicU64>,
     /// Whether a slot of `pending_edits` may be set.
     pub edits_pending: AtomicBool,
+    /// MXM PATCH (suspended processing): the generation a pending edit is made in, read as it is
+    /// made and kept in its slot; a state transaction begins a new one, and supersedes only the
+    /// edits of earlier ones.
+    pub edit_generation: AtomicU32,
     /// Each parameter's place in `param_hashes`.
     pub param_index_by_hash: HashMap<u32, usize>,
 
@@ -391,6 +395,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             appliers: AtomicU32::new(0),
             pending_edits,
             edits_pending: AtomicBool::new(false),
+            edit_generation: AtomicU32::new(0),
             param_index_by_hash,
 
             param_hashes,
@@ -672,7 +677,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         if !normalized_value.is_finite() {
             return kInvalidArgument;
         }
-        self.pending_edits[index].store(pending(normalized_value), Ordering::SeqCst);
+        let generation = self.edit_generation.load(Ordering::SeqCst);
+        self.pending_edits[index].store(pending(normalized_value, generation), Ordering::SeqCst);
         self.edits_pending.store(true, Ordering::SeqCst);
         self.apply_pending_edits_if_idle();
         kResultOk
@@ -726,33 +732,43 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         true
     }
 
-    /// Takes the pending edits out of their slots as a state transaction begins: the state it loads
-    /// supersedes them if it loads, and [`restore_pending_edits`][Self::restore_pending_edits] puts
-    /// them back if it is refused. An edit made while it runs stays in its slot, and is applied
-    /// after (VST3 review, 2026-10-29).
-    fn take_pending_edits(&self) -> Vec<u64> {
-        self.edits_pending.store(false, Ordering::SeqCst);
-        self.pending_edits
-            .iter()
-            .map(|slot| slot.swap(0, Ordering::SeqCst))
-            .collect()
-    }
-
-    /// A refused transaction's pending edits back in their slots, each unless its parameter has a
-    /// newer one there.
-    fn restore_pending_edits(&self, taken: Vec<u64>) {
-        let mut restored = false;
-        for (slot, edit) in self.pending_edits.iter().zip(taken) {
-            if edit != 0
-                && slot
-                    .compare_exchange(0, edit, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            {
-                restored = true;
+    /// Drops the pending edits made before the state transaction of generation `boundary`, which
+    /// the state it loaded supersedes: those of other generations. One made after it began carries
+    /// `boundary` and stays, and the compare-exchange keeps one that replaced an older edit
+    /// meanwhile. A refused transaction drops none (VST3 review, 2026-10-29).
+    fn supersede_pending_edits(&self, boundary: u32) {
+        for slot in &self.pending_edits {
+            let edit = slot.load(Ordering::SeqCst);
+            if taken(edit).is_some() && generation_of(edit) != boundary {
+                let _ = slot.compare_exchange(edit, 0, Ordering::SeqCst, Ordering::SeqCst);
             }
         }
-        if restored {
-            self.edits_pending.store(true, Ordering::SeqCst);
+    }
+
+    /// MXM PATCH (suspended processing): `params`, a state being saved, with each pending edit's
+    /// value in place of its parameter's: an edit the host has been told of (`performEdit`) is
+    /// saved though no block has applied it yet (VST3 review, 2026-10-29).
+    pub fn overlay_pending_edits(&self, params: &mut BTreeMap<String, ParamValue>) {
+        for (slot, hash) in self.pending_edits.iter().zip(&self.param_hashes) {
+            let Some(normalized) = taken(slot.load(Ordering::SeqCst)) else {
+                continue;
+            };
+            let (Some(id), Some(param)) = (
+                self.param_id_by_hash.get(hash),
+                self.param_by_hash.get(hash),
+            ) else {
+                continue;
+            };
+            // SAFETY: the parameters outlive the wrapper, as everywhere `param_by_hash` is read.
+            let value = unsafe {
+                match *param {
+                    ParamPtr::FloatParam(p) => ParamValue::F32((*p).preview_plain(normalized)),
+                    ParamPtr::IntParam(p) => ParamValue::I32((*p).preview_plain(normalized)),
+                    ParamPtr::BoolParam(p) => ParamValue::Bool((*p).preview_plain(normalized)),
+                    ParamPtr::EnumParam(p) => ParamValue::I32((*p).preview_plain(normalized)),
+                }
+            };
+            params.insert(id.clone(), value);
         }
     }
 
@@ -786,17 +802,19 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         // the host for a restart, which a host may answer at once by taking the lock.
         let mut activate_context = self.make_activate_context();
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
-        // The edits made before the load, taken as it begins, before either wait: one made
-        // while it waits is newer than the state it loads, and stays.
-        let earlier_edits = self.take_pending_edits();
+        // A new edit generation as it begins, before either wait: an edit made from here on is
+        // newer than the state it loads, and stays.
+        let boundary = self
+            .edit_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+            & GENERATION_MASK;
         if !self.appliers_drained() {
-            self.restore_pending_edits(earlier_edits);
             self.finish_state_transaction();
             crate::nice_error!("Failed to load state: an edit was still being applied");
             return false;
         }
         let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
-            self.restore_pending_edits(earlier_edits);
             self.finish_state_transaction();
             crate::nice_error!("Failed to load state: could not acquire the plugin lock");
             return false;
@@ -853,8 +871,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             }
             crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
         }
-        if !success {
-            self.restore_pending_edits(earlier_edits);
+        if success {
+            self.supersede_pending_edits(boundary);
         }
         drop(transaction);
         drop(plugin);
@@ -930,12 +948,22 @@ impl<P: Vst3Plugin> Drop for InProcess<'_, P> {
     }
 }
 
-/// The flag marking a pending edit's slot.
+/// The flag marking a pending edit's slot: its value's bits below, its generation above.
 const PENDING: u64 = 1 << 32;
+const GENERATION_SHIFT: u32 = 33;
+/// The generation bits a slot keeps; generations wrap within them.
+const GENERATION_MASK: u32 = (1 << 31) - 1;
 
-/// `value` as a pending edit's slot.
-fn pending(value: f32) -> u64 {
-    PENDING | u64::from(value.to_bits())
+/// `value`, made in `generation`, as a pending edit's slot.
+fn pending(value: f32, generation: u32) -> u64 {
+    PENDING
+        | (u64::from(generation & GENERATION_MASK) << GENERATION_SHIFT)
+        | u64::from(value.to_bits())
+}
+
+/// A pending edit's generation.
+fn generation_of(slot: u64) -> u32 {
+    (slot >> GENERATION_SHIFT) as u32
 }
 
 /// A slot's pending edit, if any.
@@ -1020,10 +1048,11 @@ mod tests {
     #[test]
     fn a_pending_edit_is_its_value() {
         for value in [0.0f32, 0.25, 1.0, -0.0, f32::MIN_POSITIVE] {
-            assert_eq!(
-                taken(pending(value)).map(f32::to_bits),
-                Some(value.to_bits())
-            );
+            for generation in [0, 7, GENERATION_MASK, u32::MAX] {
+                let slot = pending(value, generation);
+                assert_eq!(taken(slot).map(f32::to_bits), Some(value.to_bits()));
+                assert_eq!(generation_of(slot), generation & GENERATION_MASK);
+            }
         }
         assert_eq!(taken(0), None);
     }

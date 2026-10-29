@@ -567,12 +567,16 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
 
         let state = unsafe { ComRef::from_raw(state).unwrap() };
 
-        let serialized = unsafe {
-            state::serialize_json::<P>(
+        // MXM PATCH (suspended processing): with each pending edit's value, so an edit the host
+        // was told of is saved though no block has applied it yet.
+        let mut plugin_state = unsafe {
+            state::serialize_object::<P>(
                 self.inner.params.clone(),
                 state::make_params_iter(&self.inner.param_by_hash, &self.inner.param_id_to_hash),
             )
         };
+        self.inner.overlay_pending_edits(&mut plugin_state.params);
+        let serialized = state::encode_json(&plugin_state);
         match serialized {
             Ok(serialized) => {
                 let mut num_bytes_written = 0;
