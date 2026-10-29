@@ -786,17 +786,21 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         // the host for a restart, which a host may answer at once by taking the lock.
         let mut activate_context = self.make_activate_context();
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
+        // The edits made before the load, taken as it begins, before either wait: one made
+        // while it waits is newer than the state it loads, and stays.
+        let earlier_edits = self.take_pending_edits();
         if !self.appliers_drained() {
+            self.restore_pending_edits(earlier_edits);
             self.finish_state_transaction();
             crate::nice_error!("Failed to load state: an edit was still being applied");
             return false;
         }
         let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
+            self.restore_pending_edits(earlier_edits);
             self.finish_state_transaction();
             crate::nice_error!("Failed to load state: could not acquire the plugin lock");
             return false;
         };
-        let earlier_edits = self.take_pending_edits();
         // The attempt and its rollback under one number (`state::state_transaction`).
         let transaction = state::TransactionScope::begin();
         let mut previous = permit_alloc(|| unsafe {
