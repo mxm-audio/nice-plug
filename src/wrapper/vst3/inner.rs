@@ -1,6 +1,5 @@
 use atomic_refcell::AtomicRefCell;
 use crossbeam::atomic::AtomicCell;
-use crossbeam::channel;
 use nice_plug_core::audio_setup::{AudioIOLayout, BufferConfig, ProcessMode};
 #[cfg(feature = "editor")]
 use nice_plug_core::context::gui::GuiContext;
@@ -20,11 +19,14 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use try_lock::TryLock;
 #[cfg(feature = "editor")]
 use vst3::ComWrapper;
 use vst3::Steinberg::Vst::{IComponentHandler, IComponentHandlerTrait, IEventList, RestartFlags_};
+#[cfg(feature = "editor")]
+use vst3::Steinberg::Vst::{IComponentHandler2, IComponentHandler2Trait};
 use vst3::Steinberg::{kInvalidArgument, kResultOk, tresult};
 use vst3::{ComPtr, ComRef};
 
@@ -37,6 +39,7 @@ use crate::util::permit_alloc;
 use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::BufferManager;
 use crate::wrapper::util::hash_param_id;
+use crate::wrapper::util::process_wrapper;
 use crate::wrapper::vst3::Vst3Plugin;
 #[cfg(feature = "editor")]
 use crate::wrapper::vst3::context::WrapperGuiContext;
@@ -140,17 +143,20 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// then do the block splitting based on that. Note events need to have their timing adjusted to
     /// match the block start, since they're all read upfront.
     pub process_events: AtomicRefCell<Vec<ProcessEvent<P>>>,
-    /// The plugin is able to restore state through a method on the `GuiContext`. To avoid changing
-    /// parameters mid-processing and running into garbled data if the host also tries to load state
-    /// at the same time the restoring happens at the end of each processing call. If this zero
-    /// capacity channel contains state data at that point, then the audio thread will take the
-    /// state out of the channel, restore the state, and then send it back through the same channel.
-    /// In other words, the GUI thread acts as a sender and then as a receiver, while the audio
-    /// thread acts as a receiver and then as a sender. That way deallocation can happen on the GUI
-    /// thread. All of this happens without any blocking on the audio thread.
-    pub updated_state_sender: channel::Sender<PluginState>,
-    /// The receiver belonging to [`new_state_sender`][Self::new_state_sender].
-    pub updated_state_receiver: channel::Receiver<PluginState>,
+    /// MXM PATCH (defect 8, ported to VST3): set while a state transaction holds the plugin lock,
+    /// so a `process()` call meanwhile outputs silence and carries on rather than reporting an
+    /// error the host may hold against the plugin.
+    pub state_transaction_active: AtomicBool,
+    /// Whether the host has the plugin active (`IComponent::setActive`): a state transaction
+    /// reactivates it only then.
+    pub is_active: AtomicBool,
+    /// MXM PATCH (suspended processing): when the last `process()` call began, in nanoseconds since
+    /// [`epoch`][Self::epoch], 0 before the first. A host may keep a plugin processing and run no
+    /// block for it (DaVinci Resolve, 2026-10-29), so an edit is applied here, not left for a block
+    /// to bring, once none has come for [`PROCESS_STALL`].
+    pub last_process_nanos: AtomicU64,
+    /// The instant [`last_process_nanos`][Self::last_process_nanos] counts from.
+    pub epoch: Instant,
 
     /// The keys from `param_map` in a stable order.
     pub param_hashes: Vec<u32>,
@@ -238,10 +244,6 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     pub fn new() -> Arc<Self> {
         let mut plugin = P::default();
         let task_executor = Mutex::new(plugin.task_executor());
-
-        // This is used to allow the plugin to restore preset data from its editor, see the comment
-        // on `Self::updated_state_sender`
-        let (updated_state_sender, updated_state_receiver) = channel::bounded(0);
 
         // This is a mapping from the parameter IDs specified by the plugin to pointers to those
         // parameters. These pointers are assumed to be safe to dereference as long as
@@ -371,8 +373,10 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             input_note_events,
             note_expression_controller: AtomicRefCell::new(NoteExpressionController::default()),
             process_events: AtomicRefCell::new(Vec::with_capacity(P::INPUT_EVENT_CAPACITY)),
-            updated_state_sender,
-            updated_state_receiver,
+            state_transaction_active: AtomicBool::new(false),
+            is_active: AtomicBool::new(false),
+            last_process_nanos: AtomicU64::new(0),
+            epoch: Instant::now(),
 
             param_hashes,
             param_by_hash,
@@ -585,58 +589,41 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
     }
 
-    /// Update the plugin's internal state, called by the plugin itself from the GUI thread. To
-    /// prevent corrupting data and changing parameters during processing the actual state is only
-    /// updated at the end of the audio processing cycle.
+    /// Update the plugin's state from its editor, on the GUI thread.
+    ///
+    /// MXM PATCH (defect 8 and GUI-authored state dirty, ported to VST3): a state with no
+    /// parameters whose fields are the ones installed only tells the host there is something to
+    /// save, through `IComponentHandler2::setDirty`; anything else is
+    /// [`set_state_inner()`][Self::set_state_inner]'s transaction, here, off the audio thread.
+    /// Upstream handed the state to the audio thread over a zero-capacity channel and waited for a
+    /// block to take it, without end while the host had the plugin processing but ran no block:
+    /// DaVinci Resolve stopped responding (2026-10-29). It also restored the state, allocating, on
+    /// the audio thread.
     #[cfg(feature = "editor")]
     pub fn set_state_object_from_gui(&self, mut state: PluginState) {
-        use crossbeam::channel::SendTimeoutError;
-
-        // Use a loop and timeouts to handle the super rare edge case when this function gets called
-        // between a process call and the host disabling the plugin
-        loop {
-            if self.is_processing.load(Ordering::SeqCst) {
-                // If the plugin is currently processing audio, then we'll perform the restore
-                // operation at the end of the audio call. This involves sending the state to the
-                // audio thread, having the audio thread handle the state restore at the very end of
-                // the process function, and then sending the state back to this thread so it can be
-                // deallocated without blocking the audio thread.
-                match self
-                    .updated_state_sender
-                    .send_timeout(state, std::time::Duration::from_secs(1))
-                {
-                    Ok(_) => {
-                        // As mentioned above, the state object will be passed back to this thread
-                        // so we can deallocate it without blocking.
-                        let state = self.updated_state_receiver.recv();
-                        drop(state);
-                        break;
-                    }
-                    Err(SendTimeoutError::Timeout(value)) => {
-                        state = value;
-                        continue;
-                    }
-                    Err(SendTimeoutError::Disconnected(_)) => {
-                        crate::nice_debug_assert_failure!("State update channel got disconnected");
-                        return;
-                    }
-                }
-            } else {
-                // Otherwise we'll set the state right here and now, since this function should be
-                // called from a GUI thread
-                self.set_state_inner(&mut state);
-                break;
-            }
+        if state::gui_state_is_dirty_only(&state, &self.params.serialize_fields()) {
+            self.mark_dirty();
+            return;
+        }
+        if self.set_state_inner(&mut state) {
+            self.mark_dirty();
         }
 
         // After the state has been updated, notify the host about the new parameter values
-        let task_posted = self
-            .event_loop
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .schedule_gui(Task::TriggerRestart(RestartFlags_::kParamValuesChanged));
+        let task_posted =
+            self.schedule_gui(Task::TriggerRestart(RestartFlags_::kParamValuesChanged));
         crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
+    }
+
+    /// MXM PATCH (GUI-authored state dirty, ported to VST3): tells the host the plugin's state
+    /// changed outside its parameters, where the host has `IComponentHandler2`.
+    #[cfg(feature = "editor")]
+    fn mark_dirty(&self) {
+        if let Some(handler) = &*self.component_handler.borrow()
+            && let Some(handler) = handler.cast::<IComponentHandler2>()
+        {
+            unsafe { handler.setDirty(1) };
+        }
     }
 
     pub fn set_latency_samples(&self, samples: u32) {
@@ -652,45 +639,140 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
     }
 
-    /// Immediately set the plugin state. Returns `false` if the deserialization failed. The plugin
-    /// state is set from a couple places, so this function aims to deduplicate that. Includes
-    /// `permit_alloc()`s around the deserialization and initialization for the use case where
-    /// `set_state_object_from_gui()` was called while the plugin is process audio.
+    /// MXM PATCH (suspended processing): whether the host will bring an edit to the processor in a
+    /// block: it has the plugin processing and has run one within [`PROCESS_STALL`]. Otherwise the
+    /// edit is applied where it is made.
+    pub fn host_delivers_edits(&self) -> bool {
+        self.is_processing.load(Ordering::SeqCst)
+            && ran_recently(
+                self.last_process_nanos.load(Ordering::Relaxed),
+                self.nanos_now(),
+            )
+    }
+
+    /// Notes that a `process()` call began.
+    pub fn note_process(&self) {
+        self.last_process_nanos
+            .store(self.nanos_now().max(1), Ordering::Relaxed);
+    }
+
+    fn nanos_now(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Immediately set the plugin state, as one transaction: `false`, with the previous state
+    /// back, if a parameter or field refused it or reactivation failed. Called by the host's
+    /// `setState()` and by [`set_state_object_from_gui()`][Self::set_state_object_from_gui], never
+    /// on the audio thread.
     ///
-    /// Implicitly emits `Task::ParameterValuesChanged`.
+    /// Implicitly emits `Task::StateChanged`.
     ///
     /// # Notes
     ///
     /// `self.plugin` must _not_ be locked while calling this function or it will deadlock.
     pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
-        // FIXME: This is obviously not realtime-safe, but loading presets without doing this
-        //        could lead to inconsistencies. `state::deserialize_object()` normally never
-        //        allocates, but if the plugin has persistent non-parameter data then its
-        //        `deserialize_fields()` implementation may still allocate.
-        let success = permit_alloc(|| unsafe {
+        // MXM PATCH (defect 8, ported to VST3): the CLAP wrapper's transaction. The working
+        // snapshot is taken and the plugin lock held across deserialize + reactivate, so a state
+        // a field refuses (defects 9 and 11) or an activation that fails leaves parameters, fields
+        // and engine as they were. Upstream's VST3 wrapper wrote parameters and fields first and
+        // returned `false` with no rollback, leaving a mix of the old state and the new.
+        let audio_io_layout = self.current_audio_io_layout.load();
+        let buffer_config = self.current_buffer_config.load();
+        let reactivate = buffer_config.filter(|_| self.is_active.load(Ordering::SeqCst));
+        // Made before the lock and dropped after it, as `setActive()` does: dropping it may ask
+        // the host for a restart, which a host may answer at once by taking the lock.
+        let mut activate_context = self.make_activate_context();
+        self.state_transaction_active.store(true, Ordering::SeqCst);
+        let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
+            self.state_transaction_active.store(false, Ordering::SeqCst);
+            crate::nice_error!("Failed to load state: could not acquire the plugin lock");
+            return false;
+        };
+        let mut previous = permit_alloc(|| unsafe {
+            state::serialize_object::<P>(
+                self.params.clone(),
+                state::make_params_iter(&self.param_by_hash, &self.param_id_to_hash),
+            )
+        });
+        let mut success = permit_alloc(|| unsafe {
             state::deserialize_object::<P>(
                 state,
                 self.params.clone(),
                 state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
-                self.current_buffer_config.load().as_ref(),
+                buffer_config.as_ref(),
             )
         });
-        if !success {
-            crate::nice_debug_assert_failure!(
-                "Deserializing plugin state from a state object failed"
-            );
-            return false;
+        if success && let Some(buffer_config) = reactivate {
+            success = permit_alloc(|| {
+                plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
+            });
+            if success {
+                process_wrapper(|| plugin.reset());
+            }
         }
+        if !success {
+            let restored = permit_alloc(|| unsafe {
+                state::deserialize_object::<P>(
+                    &mut previous,
+                    self.params.clone(),
+                    state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
+                    buffer_config.as_ref(),
+                )
+            });
+            let mut reactivated = restored;
+            if restored && let Some(buffer_config) = reactivate {
+                // No reset: a rejected state must be observationally absent, as in the CLAP
+                // wrapper, and the working engine keeps its history.
+                reactivated = permit_alloc(|| {
+                    plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
+                });
+            }
+            crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
+        }
+        drop(plugin);
+        self.state_transaction_active.store(false, Ordering::SeqCst);
+        drop(activate_context);
 
+        crate::nice_debug_assert!(
+            success,
+            "Loading plugin state failed; restored previous state"
+        );
+
+        // After a rollback too: either way the editor's view of the values may be stale.
         #[cfg(feature = "editor")]
         {
-            // Reinitialize the plugin after loading state so it can respond to the new parameter values
             let task_posted = self.schedule_gui(Task::StateChanged);
             crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
         }
 
         success
     }
+
+    /// MXM PATCH (defect 8, ported to VST3): wait for the plugin's `TryLock` off the audio thread,
+    /// as `setActive()` does, giving up after one second.
+    fn lock_plugin_for_state_transaction(&self) -> Option<try_lock::Locked<'_, P>> {
+        let started = Instant::now();
+        loop {
+            if let Some(plugin) = self.plugin.try_lock() {
+                return Some(plugin);
+            }
+            if started.elapsed() > Duration::from_secs(1) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// MXM PATCH (suspended processing): how long without a `process()` call before an edit is applied
+/// where it is made rather than left for a block to bring. Far longer than any host's block, so a
+/// host that is running blocks always brings the edits itself.
+pub const PROCESS_STALL: Duration = Duration::from_millis(250);
+
+/// Whether a block began, at `last` nanoseconds (0 for none yet), within [`PROCESS_STALL`] of
+/// `now`.
+fn ran_recently(last: u64, now: u64) -> bool {
+    last != 0 && now.saturating_sub(last) < PROCESS_STALL.as_nanos() as u64
 }
 
 impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
@@ -758,5 +840,22 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A host that runs no block for a while no longer brings the edits** (suspended
+    /// processing): none yet, or the last more than [`PROCESS_STALL`] ago, and the edit is the
+    /// editor's to apply.
+    #[test]
+    fn a_stalled_host_brings_no_edits() {
+        let stall = PROCESS_STALL.as_nanos() as u64;
+        assert!(!ran_recently(0, 5), "no block yet");
+        assert!(ran_recently(1_000, 1_000 + stall - 1));
+        assert!(!ran_recently(1_000, 1_000 + stall));
+        assert!(ran_recently(1_000, 500), "a clock read before the block");
     }
 }

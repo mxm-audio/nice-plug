@@ -172,6 +172,17 @@ pub(crate) unsafe fn serialize_json<'a, P: Plugin>(
     }
 }
 
+/// MXM PATCH (GUI-authored state dirty): whether an editor's state is the explicit dirty-only
+/// transaction: no parameter writes and exactly the fields already installed by the plugin's
+/// control-side publisher. Comparing the BTreeMaps also compares each field's canonical serialized
+/// representation. Both wrappers tell the host it is dirty and restore nothing.
+pub(crate) fn gui_state_is_dirty_only(
+    state: &PluginState,
+    current_fields: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    state.params.is_empty() && &state.fields == current_fields
+}
+
 /// Deserialize a plugin's state from a [`PluginState`] object. This is used to allow the plugin to
 /// do its own internal preset management. Returns `false` and logs an error if the state could not
 /// be deserialized.

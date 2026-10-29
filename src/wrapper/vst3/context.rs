@@ -420,13 +420,11 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
                     // the plugin is currently processing audio, the host will pass this change back
                     // to the plugin in the audio callback. This also prevents the values from
                     // changing in the middle of the process callback, which would be unsound.
-                    // FIXME: So this doesn't work for REAPER, because they just silently stop
-                    //        processing audio when you bypass the plugin. Great. We can add a time
-                    //        based heuristic to work around this in the meantime.
-                    if !inner
-                        .is_processing
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                    {
+                    // MXM PATCH (suspended processing): REAPER stops processing a bypassed
+                    // plugin and DaVinci Resolve an idle track's while it stays processing, so a
+                    // host that has run no block for a while does not bring the edit: it is set
+                    // here (`WrapperInner::host_delivers_edits`).
+                    if !inner.host_delivers_edits() {
                         inner.set_normalized_value_by_hash(
                             *hash,
                             normalized,

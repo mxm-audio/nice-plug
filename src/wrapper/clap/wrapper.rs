@@ -123,7 +123,7 @@ use crate::wrapper::clap::note_names::NoteNames;
 #[cfg(feature = "editor")]
 use crate::wrapper::clap::presets::ClapPresetLoader;
 use crate::wrapper::clap::util::{read_stream, write_stream};
-use crate::wrapper::state::{self};
+use crate::wrapper::state::{self, gui_state_is_dirty_only};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{clamp_input_event_timing, hash_param_id, process_wrapper, strlcpy};
 
@@ -4286,16 +4286,6 @@ impl<P: ClapPlugin> Wrapper<P> {
             None => false,
         }
     }
-}
-
-// MXM PATCH (GUI-authored state dirty): the explicit dirty-only transaction contains no parameter
-// writes and exactly the fields already installed by the plugin's control-side publisher. Comparing
-// the BTreeMaps also compares each field's canonical serialized representation.
-fn gui_state_is_dirty_only(
-    state: &PluginState,
-    current_fields: &std::collections::BTreeMap<String, String>,
-) -> bool {
-    state.params.is_empty() && &state.fields == current_fields
 }
 
 /// Convenience function to query an extension from the host.

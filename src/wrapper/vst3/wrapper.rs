@@ -469,6 +469,9 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 // NOTE: This needs to be dropped after the `plugin` lock to avoid deadlocks
                 drop(activate_context);
 
+                if result == kResultOk {
+                    self.inner.is_active.store(true, Ordering::SeqCst);
+                }
                 result
             }
             (true, None) => kResultFalse,
@@ -479,6 +482,7 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 loop {
                     if let Some(mut plugin) = self.inner.plugin.try_lock() {
                         plugin.deactivate();
+                        self.inner.is_active.store(false, Ordering::SeqCst);
                         break;
                     } else if now.elapsed() > Duration::from_secs(1) {
                         crate::nice_error!("Failed to acquire lock on plugin while deactivating");
@@ -768,8 +772,9 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
 
     unsafe fn setParamNormalized(&self, id: ParamID, value: ParamValue) -> tresult {
         // If the plugin is currently processing audio, then this parameter change will also be sent
-        // to the process function
-        if self.inner.is_processing.load(Ordering::SeqCst) {
+        // to the process function. MXM PATCH (suspended processing): only while the host runs
+        // blocks; a host that keeps the plugin processing and runs none would leave it unapplied.
+        if self.inner.host_delivers_edits() {
             return kResultOk;
         }
 
@@ -854,8 +859,11 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
 
                 // NOTE: We completely ignore the speaker arrangements and only look at the channel
                 //       counts here. This may cause issues at some point, but it works for now.
+                // MXM PATCH (bus arrangement): the aux buses follow the main one, as
+                // `getBusInfo()` numbers them; upstream checked the main bus in the first aux's
+                // place.
                 let has_main_input = layout.main_input_channels.is_some();
-                let aux_input_start_idx = if has_main_input { 0 } else { 1 };
+                let aux_input_start_idx = if has_main_input { 1 } else { 0 };
                 if has_main_input
                     && unsafe {
                         (*inputs).count_ones() != layout.main_input_channels.unwrap().get()
@@ -873,7 +881,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 }
 
                 let has_main_output = layout.main_output_channels.is_some();
-                let aux_output_start_idx = if has_main_output { 0 } else { 1 };
+                let aux_output_start_idx = if has_main_output { 1 } else { 0 };
                 if unsafe {
                     (*outputs).count_ones()
                         != layout
@@ -986,14 +994,6 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         let setup = unsafe { &*setup };
         crate::nice_debug_assert_eq!(setup.symbolicSampleSize, K_SYMBOLIC_SAMPLE_SIZE_32);
 
-        // This is needed when activating the plugin and when restoring state
-        self.inner.current_buffer_config.store(Some(BufferConfig {
-            sample_rate: setup.sampleRate as f32,
-            min_buffer_size: None,
-            max_buffer_size: setup.maxSamplesPerBlock as u32,
-            process_mode: self.inner.current_process_mode.load(),
-        }));
-
         #[allow(clippy::unnecessary_cast)]
         const K_REALTIME: i32 = ProcessModes_::kRealtime as i32;
         #[allow(clippy::unnecessary_cast)]
@@ -1014,6 +1014,16 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
             }
         };
         self.inner.current_process_mode.store(mode);
+
+        // This is needed when activating the plugin and when restoring state. MXM PATCH (process
+        // mode): with this setup's mode; upstream stored the buffer configuration before reading
+        // it, so each activation ran in the mode of the setup before.
+        self.inner.current_buffer_config.store(Some(BufferConfig {
+            sample_rate: setup.sampleRate as f32,
+            min_buffer_size: None,
+            max_buffer_size: setup.maxSamplesPerBlock as u32,
+            process_mode: mode,
+        }));
 
         // Initializing the plugin happens in `IAudioProcessor::set_active()` because the host may
         // still change the channel layouts at this point
@@ -1062,6 +1072,8 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         // Panic on allocations if the `assert_process_allocs` feature has been enabled, and make
         // sure that FTZ is set up correctly
         process_wrapper(|| {
+            self.inner.note_process();
+
             // We need to handle incoming automation first
             let data = unsafe { &*data };
             let sample_rate = self
@@ -1351,7 +1363,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
             let mut block_start = 0usize;
             let mut block_end;
             let mut event_start_idx = 0;
-            let result = loop {
+            loop {
                 // In sample-accurate automation mode we'll handle all parameter changes from the
                 // sorted process event array until we run into for the current sample, and then
                 // process the block between the current sample and the sample containing the next
@@ -1454,8 +1466,10 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     .iter_mut()
                                     .enumerate()
                                 {
+                                    // MXM PATCH (aux buses): within the input buses the
+                                    // host passed; upstream bounded them by the outputs.
                                     let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                    if aux_input_idx > data.numOutputs as usize {
+                                    if aux_input_idx >= data.numInputs as usize {
                                         break;
                                     }
 
@@ -1479,7 +1493,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     .enumerate()
                                 {
                                     let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                    if aux_output_idx > data.numOutputs as usize {
+                                    if aux_output_idx >= data.numOutputs as usize {
                                         break;
                                     }
 
@@ -1603,6 +1617,19 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                 plugin.process(buffers.main_buffer, &mut aux, &mut context);
                             self.inner.last_process_status.store(result);
                             result
+                        } else if self.inner.state_transaction_active.load(Ordering::SeqCst) {
+                            // MXM PATCH (defect 8, ported to VST3): a state load holds the lock
+                            // on purpose; this block is silence and the host carries on, as in
+                            // the CLAP wrapper. The load resets the plugin.
+                            for channel in buffers.main_buffer.as_slice() {
+                                channel.fill(0.0);
+                            }
+                            for buffer in buffers.aux_outputs.iter_mut() {
+                                for channel in buffer.as_slice() {
+                                    channel.fill(0.0);
+                                }
+                            }
+                            ProcessStatus::Normal
                         } else {
                             ProcessStatus::Error("Failed to acquire plugin lock")
                         }
@@ -1628,29 +1655,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 } else {
                     block_start = block_end;
                 }
-            };
-
-            // After processing audio, we'll check if the editor has sent us updated plugin state.
-            // We'll restore that here on the audio thread to prevent changing the values during the
-            // process call and also to prevent inconsistent state when the host also wants to load
-            // plugin state.
-            // FIXME: Zero capacity channels allocate on receiving, find a better alternative that
-            //        doesn't do that
-            let updated_state = permit_alloc(|| self.inner.updated_state_receiver.try_recv());
-            if let Ok(mut state) = updated_state {
-                self.inner.set_state_inner(&mut state);
-
-                // We'll pass the state object back to the GUI thread so deallocation can happen
-                // there without potentially blocking the audio thread
-                if let Err(err) = self.inner.updated_state_sender.send(state) {
-                    crate::nice_debug_assert_failure!(
-                        "Failed to send state object back to GUI thread: {}",
-                        err
-                    );
-                };
             }
-
-            result
         })
     }
 

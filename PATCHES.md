@@ -808,3 +808,38 @@ loader and the host hears `loaded`; a refusal and a location that isn't a file r
 `on_error` with why). `cargo check --no-default-features` fails on `src/host_keys.rs`, which
 predates this patch (the *Host keys* capability imports the editor module unconditionally); the
 presets patch builds with and without `editor`.
+
+## The VST3 wrapper in DaVinci Resolve — fixes (2026-10-29)
+
+Found in DaVinci Resolve 21.1, which loads only VST3, by mxm-fx-eq-n's owner and a review with a
+second model. Resolve keeps an idle track's plugins processing (`setProcessing(true)`) and runs no
+block for them, and upstream's VST3 wrapper waited for a block in two places. The CLAP wrapper had
+the fixes for the state paths already (defect 8, *GUI-authored state dirty*); they are ported.
+
+- **GUI state** (`inner.rs`, `set_state_object_from_gui`): a state with no parameters and the
+  fields installed is the dirty-only transaction, answered with `IComponentHandler2::setDirty` and
+  nothing restored; anything else is `set_state_inner()`'s transaction, on the GUI thread. Upstream
+  sent the state over a zero-capacity channel to the audio thread, retried a one-second send without
+  end, then blocked on the reply: Resolve stopped responding. The channel is gone, and with it the
+  restore, allocating, at the end of `process()`.
+- **State transaction** (`set_state_inner`): the CLAP wrapper's defect 8 — the working snapshot
+  taken, the plugin lock held across deserialize and reactivation (only while the host has the
+  plugin active), and a refused state (defects 9 and 11) or failed activation rolled back whole.
+  Upstream wrote parameters and fields first and returned `false`, leaving a mix. The activation
+  context is dropped after the lock, as `setActive()` does: its latency request may make the host
+  take the lock at once. A `process()` call meanwhile outputs silence and returns `kResultOk`.
+- **Suspended processing** (`host_delivers_edits`): an editor's edit and the host's
+  `setParamNormalized` were applied only through a block while the host had the plugin processing;
+  with none coming, the value never changed and the editor showed the edit undone. They are applied
+  where they are made once no block has begun for `PROCESS_STALL` (250 ms), far longer than any
+  host's block. Upstream's own FIXME named REAPER, which stops processing a bypassed plugin.
+- **Process mode** (`setupProcessing`): the buffer configuration was stored before the setup's mode
+  was read, so each activation ran in the previous setup's mode.
+- **Aux buses** (`process`, `setBusArrangements`): an aux input was bounded by `numOutputs` with
+  `>`, so a host passing fewer input buses had one read past them; it is bounded by `numInputs`, an
+  aux output by `numOutputs`, with `>=`. The arrangement check took the main bus for the first aux
+  bus; aux buses follow the main one, as `getBusInfo()` numbers them.
+
+Tests: `wrapper::vst3::inner::tests::a_stalled_host_brings_no_edits`; mxm-fx-eq-n's host test
+`a_restore_that_reads_back_changed_keeps_its_bands` runs its VST3 through `mxm-vst3-host`: a taken
+id, older view settings and learn accepted, and a state a field refuses rolled back whole.
