@@ -2061,6 +2061,11 @@ impl<P: ClapPlugin> Wrapper<P> {
         // transaction holds it, a concurrent `process()` discards its block with
         // `CLAP_PROCESS_ERROR` instead of blocking on it the way the 0.3.0 mutex did; see
         // `state_transactions`.
+        //
+        // One activation context for the transaction, made before the lock and dropped after it,
+        // as `make_activate_context()` asks: dropping it may report a latency change, whose
+        // restart a host may answer at once by taking the lock (VST3 review, 2026-10-29).
+        let mut activate_context = self.make_activate_context();
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
         let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
             self.state_transactions.fetch_add(1, Ordering::SeqCst);
@@ -2096,14 +2101,12 @@ impl<P: ClapPlugin> Wrapper<P> {
         let mut activated = false;
         if success && let Some(buffer_config) = reactivate {
             activated = true;
-            let mut activate_context = self.make_activate_context();
             success = permit_alloc(|| {
                 plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
             });
             if success {
                 process_wrapper(|| plugin.reset());
             }
-            drop(activate_context);
         }
 
         if !success {
@@ -2123,7 +2126,6 @@ impl<P: ClapPlugin> Wrapper<P> {
                 && activated
                 && let Some(buffer_config) = reactivate
             {
-                let mut activate_context = self.make_activate_context();
                 reactivated = permit_alloc(|| {
                     plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
                 });
@@ -2132,13 +2134,13 @@ impl<P: ClapPlugin> Wrapper<P> {
                 // response, delay, and tail histories even though the requested state did not load.
                 // A plugin's failed activation must leave its prior runtime state usable; the
                 // successful state-load arm above remains responsible for its normal reset contract.
-                drop(activate_context);
             }
             crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
         }
         drop(transaction);
         drop(plugin);
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
+        drop(activate_context);
 
         crate::nice_debug_assert!(
             success,

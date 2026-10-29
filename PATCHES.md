@@ -836,7 +836,9 @@ the fixes for the state paths already (defect 8, *GUI-authored state dirty*); th
   tell it undoes the attempt (`rolling_back`). The attempt and its rollback run under one
   transaction number (`state_transaction`, `TransactionScope`; both wrappers), so a rollback undoes
   only its own attempt's side effects. The CLAP wrapper reactivates only while `is_activated`, as
-  the VST3 one does with `is_active`: it had taken the retained buffer configuration for it. `is_active` is set before `setActive()` drops its
+  the VST3 one does with `is_active`: it had taken the retained buffer configuration for it. Its
+  transaction now holds one activation context, made before the lock and dropped after it, as
+  `make_activate_context()` asks; defect 8 had dropped each under the lock. `is_active` is set before `setActive()` drops its
   activation context, whose restart may deactivate the plugin at once.
 - **Suspended processing** (`set_or_defer`, `InProcess`): an editor's edit and the host's
   `setParamNormalized` were applied only through a block while the host had the plugin processing;
@@ -849,8 +851,9 @@ the fixes for the state paths already (defect 8, *GUI-authored state dirty*); th
   the audio thread, so only a thread preempted mid-apply can still land an edit inside a call (the
   values are atomics: an edit then lands within the block, as a sample-accurate host change does).
   A state transaction supersedes the edits made before it: counted in first, it waits the appliers
-  out, drops the pending slots, and no edit is applied while it runs (`appliers` against
-  `state_transactions`). Upstream's own FIXME named REAPER, which stops processing a bypassed
+  out (and is refused, touching nothing, if one is still applying after a second), takes the lock,
+  and drops the pending slots only once the state has loaded; a refused load keeps them and applies
+  them after. No edit is applied while it runs (`appliers` against `state_transactions`). Upstream's own FIXME named REAPER, which stops processing a bypassed
   plugin. A time-based fallback, tried first, was dropped in review: a past block says nothing about
   the next one, and a long block outlasted it.
 - **Process mode** (`setupProcessing`): the buffer configuration was stored before the setup's mode

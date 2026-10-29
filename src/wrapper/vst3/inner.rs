@@ -713,15 +713,22 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     }
 
     /// A state transaction's start, counted in already: waits out the threads applying pending
-    /// edits, for a second at most, then drops the edits made before it, which the state it loads
-    /// supersedes.
-    fn supersede_pending_edits(&self) {
+    /// edits, for a second at most. `false` if one is still applying, and the transaction must not
+    /// go on: it would write the parameters with that thread.
+    fn appliers_drained(&self) -> bool {
         let started = Instant::now();
-        while self.appliers.load(Ordering::SeqCst) != 0
-            && started.elapsed() < Duration::from_secs(1)
-        {
+        while self.appliers.load(Ordering::SeqCst) != 0 {
+            if started.elapsed() > Duration::from_secs(1) {
+                return false;
+            }
             std::thread::yield_now();
         }
+        true
+    }
+
+    /// Drops the pending edits: a state loaded supersedes the edits made before it. Only after a
+    /// load succeeded; a refused one keeps them.
+    fn drop_pending_edits(&self) {
         self.edits_pending.store(false, Ordering::SeqCst);
         for slot in &self.pending_edits {
             slot.store(0, Ordering::SeqCst);
@@ -751,7 +758,11 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         // the host for a restart, which a host may answer at once by taking the lock.
         let mut activate_context = self.make_activate_context();
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
-        self.supersede_pending_edits();
+        if !self.appliers_drained() {
+            self.state_transactions.fetch_add(1, Ordering::SeqCst);
+            crate::nice_error!("Failed to load state: an edit was still being applied");
+            return false;
+        }
         let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
             self.state_transactions.fetch_add(1, Ordering::SeqCst);
             crate::nice_error!("Failed to load state: could not acquire the plugin lock");
@@ -809,11 +820,14 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             }
             crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
         }
+        if success {
+            self.drop_pending_edits();
+        }
         drop(transaction);
         drop(plugin);
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
         drop(activate_context);
-        // An edit made while this ran, from another thread, is applied now if no call runs.
+        // Edits a refused load kept are applied now, if no call runs; so is one made meanwhile.
         self.apply_pending_edits_if_idle();
 
         crate::nice_debug_assert!(
