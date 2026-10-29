@@ -833,7 +833,10 @@ the fixes for the state paths already (defect 8, *GUI-authored state dirty*); th
   misuse (`state::transaction_interfered`; the CLAP wrapper too). A rollback reactivates only when
   the requested state was activated, so a state refused while deserializing leaves the working
   engine untouched (the CLAP wrapper too), and runs under `as_rollback`, so a field's `set()` can
-  tell it undoes the attempt (`rolling_back`). `is_active` is set before `setActive()` drops its
+  tell it undoes the attempt (`rolling_back`). The attempt and its rollback run under one
+  transaction number (`state_transaction`, `TransactionScope`; both wrappers), so a rollback undoes
+  only its own attempt's side effects. The CLAP wrapper reactivates only while `is_activated`, as
+  the VST3 one does with `is_active`: it had taken the retained buffer configuration for it. `is_active` is set before `setActive()` drops its
   activation context, whose restart may deactivate the plugin at once.
 - **Suspended processing** (`set_or_defer`, `InProcess`): an editor's edit and the host's
   `setParamNormalized` were applied only through a block while the host had the plugin processing;
@@ -841,9 +844,13 @@ the fixes for the state paths already (defect 8, *GUI-authored state dirty*); th
   processing, each is a pending slot per parameter, applied where it is made unless a `process()`
   call is running, and otherwise by that call as it ends: `InProcess` clears `in_process`, then
   applies the slots, so an edit is applied by one side or the other and never by another thread
-  during a call. Dekker's handshake (`applying_edits` against `in_process`) keeps a call from
-  starting while another thread applies; it spins on that at most `APPLYING_SPINS` times rather
-  than wait on the audio thread. Upstream's own FIXME named REAPER, which stops processing a bypassed
+  during a call. Dekker's handshake (`appliers` against `in_process`) keeps a call from starting
+  while another thread applies; it spins on that at most `APPLYING_SPINS` times rather than wait on
+  the audio thread, so only a thread preempted mid-apply can still land an edit inside a call (the
+  values are atomics: an edit then lands within the block, as a sample-accurate host change does).
+  A state transaction supersedes the edits made before it: counted in first, it waits the appliers
+  out, drops the pending slots, and no edit is applied while it runs (`appliers` against
+  `state_transactions`). Upstream's own FIXME named REAPER, which stops processing a bypassed
   plugin. A time-based fallback, tried first, was dropped in review: a past block says nothing about
   the next one, and a long block outlasted it.
 - **Process mode** (`setupProcessing`): the buffer configuration was stored before the setup's mode
@@ -859,3 +866,10 @@ Tests: `wrapper::vst3::inner::tests::a_pending_edit_is_its_value`,
 CLAP and its VST3 (through `mxm-vst3-host`): `a_restore_that_reads_back_changed_keeps_its_bands`, a
 taken id, older view settings and learn accepted and a state a field refuses rolled back whole; and
 `a_refused_state_leaves_the_sound_as_it_was`, the render after a refused state equal to the bit.
+Also `wrapper::state::tests::each_transaction_has_its_own_number`.
+
+**Later**: a refused state still resets the smoothers of the parameters it carried, attempt and
+rollback both calling `_internal_update_smoother(.., true)`, so a ramp in flight jumps
+(mxm-fx-curve's 20 ms Mix and Input gain; the EQ uses none). Keeping it would mean installing a
+state's fields before its parameters, for every plugin, or saving the smoothers' private state,
+which nice-plug-core does not offer.

@@ -49,6 +49,45 @@ pub fn as_rollback<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+// MXM PATCH (transaction numbers): each state transaction, its attempt and its rollback, runs under
+// a number no other has had, so a field with a side effect can tell which transaction a `set()`
+// belongs to: a rollback then undoes only its own attempt's, never an earlier restore's (VST3
+// review, 2026-10-29).
+thread_local! {
+    static TRANSACTION: Cell<u64> = const { Cell::new(0) };
+}
+static TRANSACTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The state transaction this thread is in: a number no other transaction has had, or 0 outside
+/// one.
+pub fn state_transaction() -> u64 {
+    TRANSACTION.with(Cell::get)
+}
+
+/// A state transaction's number on this thread for as long as it is held: the wrappers hold one
+/// across an attempt and its rollback.
+pub(crate) struct TransactionScope(u64);
+
+impl TransactionScope {
+    pub(crate) fn begin() -> Self {
+        let number = TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        Self(TRANSACTION.with(|transaction| transaction.replace(number)))
+    }
+}
+
+impl Drop for TransactionScope {
+    fn drop(&mut self) {
+        TRANSACTION.with(|transaction| transaction.set(self.0));
+    }
+}
+
+/// Runs `f` as one state transaction, [`state_transaction`] its number inside: for a plugin's tests
+/// driving its fields as a transaction does.
+pub fn as_transaction<T>(f: impl FnOnce() -> T) -> T {
+    let _scope = TransactionScope::begin();
+    f()
+}
+
 /// Acknowledge that the current persistent-field restore accepted `field_key` and installed a
 /// canonical value. Calling this outside `Params::deserialize_fields()` has no effect.
 pub fn accept_canonicalized_persistent_field(field_key: &'static str) {
@@ -392,6 +431,21 @@ pub(crate) fn transaction_interfered(before: u64, after: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Each transaction has its own number, and none outside one** (transaction numbers).
+    #[test]
+    fn each_transaction_has_its_own_number() {
+        assert_eq!(state_transaction(), 0);
+        let first = as_transaction(state_transaction);
+        let second = as_transaction(|| {
+            let outer = state_transaction();
+            as_transaction(|| assert_ne!(state_transaction(), outer));
+            assert_eq!(state_transaction(), outer, "the outer one's again");
+            outer
+        });
+        assert!(first != 0 && second != 0 && first != second);
+        assert_eq!(state_transaction(), 0);
+    }
 
     /// **A rollback is marked while it runs, and only then** (rollback marker): nested ones
     /// included, and cleared after.

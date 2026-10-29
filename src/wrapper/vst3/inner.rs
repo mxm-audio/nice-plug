@@ -153,9 +153,9 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     pub is_active: AtomicBool,
     /// MXM PATCH (suspended processing): set while a `process()` call runs ([`InProcess`]).
     pub in_process: AtomicBool,
-    /// MXM PATCH (suspended processing): set while a thread other than the audio thread applies
-    /// pending edits, which [`InProcess::begin`] waits out.
-    pub applying_edits: AtomicBool,
+    /// MXM PATCH (suspended processing): how many threads are applying pending edits, which
+    /// [`InProcess::begin`] and a state transaction wait out.
+    pub appliers: AtomicU32,
     /// MXM PATCH (suspended processing): per parameter, in `param_hashes`' order, an edit made
     /// while the host had the plugin processing and not yet applied ([`pending`]), or 0.
     pub pending_edits: Vec<AtomicU64>,
@@ -388,7 +388,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             state_transactions: AtomicU64::new(0),
             is_active: AtomicBool::new(false),
             in_process: AtomicBool::new(false),
-            applying_edits: AtomicBool::new(false),
+            appliers: AtomicU32::new(0),
             pending_edits,
             edits_pending: AtomicBool::new(false),
             param_index_by_hash,
@@ -674,18 +674,29 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
         self.pending_edits[index].store(pending(normalized_value), Ordering::SeqCst);
         self.edits_pending.store(true, Ordering::SeqCst);
-        // Dekker's handshake with `InProcess::begin`: of the two flags, at least one thread sees
-        // the other's set, so this thread applies only where no call has begun.
-        self.applying_edits.store(true, Ordering::SeqCst);
-        if !self.in_process.load(Ordering::SeqCst) {
-            self.apply_pending_edits();
-        }
-        self.applying_edits.store(false, Ordering::SeqCst);
+        self.apply_pending_edits_if_idle();
         kResultOk
     }
 
-    /// Applies each pending edit once, whichever thread takes it.
+    /// Applies the pending edits here, off the audio thread, if no `process()` call is running:
+    /// Dekker's handshake with `InProcess::begin`, of `appliers` against `in_process`, so at least
+    /// one of the two sees the other.
+    fn apply_pending_edits_if_idle(&self) {
+        self.appliers.fetch_add(1, Ordering::SeqCst);
+        if !self.in_process.load(Ordering::SeqCst) {
+            self.apply_pending_edits();
+        }
+        self.appliers.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Applies each pending edit once, whichever thread takes it; none while a state transaction
+    /// runs, which supersedes the edits made before it. The caller is counted in `appliers`, and a
+    /// transaction counts itself in `state_transactions` before it waits the appliers out, so of
+    /// the two at least one sees the other.
     pub fn apply_pending_edits(&self) {
+        if self.state_transactions.load(Ordering::SeqCst) % 2 == 1 {
+            return;
+        }
         if !self.edits_pending.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -699,6 +710,22 @@ impl<P: Vst3Plugin> WrapperInner<P> {
 
     fn sample_rate(&self) -> Option<f32> {
         self.current_buffer_config.load().map(|c| c.sample_rate)
+    }
+
+    /// A state transaction's start, counted in already: waits out the threads applying pending
+    /// edits, for a second at most, then drops the edits made before it, which the state it loads
+    /// supersedes.
+    fn supersede_pending_edits(&self) {
+        let started = Instant::now();
+        while self.appliers.load(Ordering::SeqCst) != 0
+            && started.elapsed() < Duration::from_secs(1)
+        {
+            std::thread::yield_now();
+        }
+        self.edits_pending.store(false, Ordering::SeqCst);
+        for slot in &self.pending_edits {
+            slot.store(0, Ordering::SeqCst);
+        }
     }
 
     /// Immediately set the plugin state, as one transaction: `false`, with the previous state
@@ -724,11 +751,14 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         // the host for a restart, which a host may answer at once by taking the lock.
         let mut activate_context = self.make_activate_context();
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
+        self.supersede_pending_edits();
         let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
             self.state_transactions.fetch_add(1, Ordering::SeqCst);
             crate::nice_error!("Failed to load state: could not acquire the plugin lock");
             return false;
         };
+        // The attempt and its rollback under one number (`state::state_transaction`).
+        let transaction = state::TransactionScope::begin();
         let mut previous = permit_alloc(|| unsafe {
             state::serialize_object::<P>(
                 self.params.clone(),
@@ -779,9 +809,12 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             }
             crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
         }
+        drop(transaction);
         drop(plugin);
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
         drop(activate_context);
+        // An edit made while this ran, from another thread, is applied now if no call runs.
+        self.apply_pending_edits_if_idle();
 
         crate::nice_debug_assert!(
             success,
@@ -829,20 +862,26 @@ impl<'a, P: Vst3Plugin> InProcess<'a, P> {
     pub fn begin(inner: &'a WrapperInner<P>) -> Self {
         inner.in_process.store(true, Ordering::SeqCst);
         for _ in 0..APPLYING_SPINS {
-            if !inner.applying_edits.load(Ordering::SeqCst) {
+            if inner.appliers.load(Ordering::SeqCst) == 0 {
                 break;
             }
             std::hint::spin_loop();
         }
-        inner.apply_pending_edits();
+        Self::apply(inner);
         Self(inner)
+    }
+
+    fn apply(inner: &WrapperInner<P>) {
+        inner.appliers.fetch_add(1, Ordering::SeqCst);
+        inner.apply_pending_edits();
+        inner.appliers.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 impl<P: Vst3Plugin> Drop for InProcess<'_, P> {
     fn drop(&mut self) {
         self.0.in_process.store(false, Ordering::SeqCst);
-        self.0.apply_pending_edits();
+        Self::apply(self.0);
     }
 }
 

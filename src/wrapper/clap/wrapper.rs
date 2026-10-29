@@ -2067,6 +2067,11 @@ impl<P: ClapPlugin> Wrapper<P> {
             crate::nice_error!("Failed to load state: could not acquire the plugin lock");
             return false;
         };
+        // The attempt and its rollback under one number (`state::state_transaction`).
+        let transaction = state::TransactionScope::begin();
+        // Reactivated only while the host has the plugin active: a deactivated plugin's next
+        // activation prepares the engine (VST3 review, 2026-10-29).
+        let reactivate = buffer_config.filter(|_| self.is_activated.load(Ordering::SeqCst));
         let mut previous = permit_alloc(|| unsafe {
             state::serialize_object::<P>(
                 self.params.clone(),
@@ -2089,7 +2094,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         // refused before it would otherwise rebuild a working engine that never changed (VST3
         // review, 2026-10-29).
         let mut activated = false;
-        if success && let Some(buffer_config) = buffer_config {
+        if success && let Some(buffer_config) = reactivate {
             activated = true;
             let mut activate_context = self.make_activate_context();
             success = permit_alloc(|| {
@@ -2116,7 +2121,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             // A `let` chain since the 0.4.2 refresh, as above.
             if restored
                 && activated
-                && let Some(buffer_config) = buffer_config
+                && let Some(buffer_config) = reactivate
             {
                 let mut activate_context = self.make_activate_context();
                 reactivated = permit_alloc(|| {
@@ -2131,6 +2136,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
         }
+        drop(transaction);
         drop(plugin);
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
 
