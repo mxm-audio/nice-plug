@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
@@ -20,6 +20,33 @@ use nice_plug_core::{
 thread_local! {
     static CANONICALIZED_FIELDS: RefCell<Vec<BTreeSet<&'static str>>> =
         const { RefCell::new(Vec::new()) };
+}
+
+// MXM PATCH (rollback marker): a refused state's rollback sets every persisted field again, to the
+// value it had before the attempt. A field whose `set()` has a side effect, such as counting the
+// host's restores, needs to know that this set undoes the attempt rather than being a restore of its
+// own (VST3 review, 2026-10-29).
+thread_local! {
+    static ROLLING_BACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread is rolling back a refused state: a persisted field's `set()` then puts back
+/// the value it had before the attempt.
+pub fn rolling_back() -> bool {
+    ROLLING_BACK.with(Cell::get)
+}
+
+/// Runs `f` as a rollback, [`rolling_back`] true inside it: the wrappers' rollback, and a plugin's
+/// tests driving a field as one does.
+pub fn as_rollback<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ROLLING_BACK.with(|rolling| rolling.set(self.0));
+        }
+    }
+    let _restore = Restore(ROLLING_BACK.with(|rolling| rolling.replace(true)));
+    f()
 }
 
 /// Acknowledge that the current persistent-field restore accepted `field_key` and installed a
@@ -355,9 +382,39 @@ pub(crate) unsafe fn deserialize_json(state: &[u8]) -> Option<PluginState> {
 }
 
 // MXM PATCH (defect 11): kept after every item, as `clippy::items_after_test_module` requires.
+/// MXM PATCH (defect 8): whether a state transaction may have held the plugin lock a `try_lock()`
+/// failed on, from the wrapper's transaction count, odd while one runs, read `before` the attempt
+/// and `after` it: one running before, begun since, or begun and ended since.
+pub(crate) fn transaction_interfered(before: u64, after: u64) -> bool {
+    before % 2 == 1 || after != before
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A rollback is marked while it runs, and only then** (rollback marker): nested ones
+    /// included, and cleared after.
+    #[test]
+    fn a_rollback_is_marked_while_it_runs() {
+        assert!(!rolling_back());
+        as_rollback(|| {
+            assert!(rolling_back());
+            as_rollback(|| assert!(rolling_back()));
+            assert!(rolling_back(), "still inside the outer one");
+        });
+        assert!(!rolling_back());
+    }
+
+    /// **A failed lock is a transaction's when the count was odd or moved** (defect 8): a flag read
+    /// only after the failure could already be cleared by a transaction just ended.
+    #[test]
+    fn a_failed_lock_is_a_transactions_when_the_count_was_odd_or_moved() {
+        assert!(!transaction_interfered(4, 4), "none: a host's own misuse");
+        assert!(transaction_interfered(5, 5), "running");
+        assert!(transaction_interfered(4, 5), "begun since");
+        assert!(transaction_interfered(4, 6), "begun and ended since");
+    }
 
     #[test]
     fn canonicalized_field_acceptance_is_scoped_and_key_specific() {

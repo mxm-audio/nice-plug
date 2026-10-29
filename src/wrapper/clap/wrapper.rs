@@ -102,7 +102,7 @@ use std::mem;
 use std::num::NonZeroU32;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
@@ -257,9 +257,12 @@ pub struct Wrapper<P: ClapPlugin> {
     /// MXM PATCH (defect 1): configured in `activate`, never exceeded in `process`.
     event_queue_limit: AtomicCell<usize>,
     dropped_input_events: AtomicU32,
-    /// MXM PATCH (defect 8, refreshed onto 0.4.2): set while `set_state_inner()` waits for or holds
-    /// the plugin lock, so `process()` can tell that deliberate exclusion from a misbehaving host.
-    state_transaction_active: AtomicBool,
+    /// MXM PATCH (defect 8, refreshed onto 0.4.2): counts each `set_state_inner()` transaction's
+    /// start and end, odd while one waits for or holds the plugin lock, so `process()` can tell that
+    /// deliberate exclusion from a misbehaving host: read before and after a `try_lock()` that
+    /// fails, odd or moved (`transaction_interfered`). A flag read only after the failure could
+    /// already be cleared by a transaction that has just ended (VST3 review, 2026-10-29).
+    state_transactions: AtomicU64,
     /// The last process status returned by the plugin. This is used for tail handling.
     last_process_status: AtomicCell<ProcessStatus>,
     /// MXM PATCH (defect 10): cached host-tail callback. The audio thread reads only this atomic
@@ -902,7 +905,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             input_events: AtomicRefCell::new(VecDeque::with_capacity(initial_event_capacity)),
             event_queue_limit: AtomicCell::new(initial_event_capacity),
             dropped_input_events: AtomicU32::new(0),
-            state_transaction_active: AtomicBool::new(false),
+            state_transactions: AtomicU64::new(0),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
             host_tail_changed: AtomicCell::new(None),
             latency_changed: AtomicBool::new(false),
@@ -2057,10 +2060,10 @@ impl<P: ClapPlugin> Wrapper<P> {
         // polled for off the audio thread, as upstream's own `activate()` does. While this
         // transaction holds it, a concurrent `process()` discards its block with
         // `CLAP_PROCESS_ERROR` instead of blocking on it the way the 0.3.0 mutex did; see
-        // `state_transaction_active`.
-        self.state_transaction_active.store(true, Ordering::SeqCst);
+        // `state_transactions`.
+        self.state_transactions.fetch_add(1, Ordering::SeqCst);
         let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
-            self.state_transaction_active.store(false, Ordering::SeqCst);
+            self.state_transactions.fetch_add(1, Ordering::SeqCst);
             crate::nice_error!("Failed to load state: could not acquire the plugin lock");
             return false;
         };
@@ -2082,7 +2085,12 @@ impl<P: ClapPlugin> Wrapper<P> {
         // A `let` chain since the 0.4.2 refresh: on 0.3.0 this was two nested `if`s because that
         // crate declared Rust 1.87 and chains are stable only from 1.88. 0.4.2 declares 1.88, and
         // Clippy's `collapsible_if` now asks for the chain.
+        // Whether the requested state was activated: only then does a rollback reactivate. A state
+        // refused before it would otherwise rebuild a working engine that never changed (VST3
+        // review, 2026-10-29).
+        let mut activated = false;
         if success && let Some(buffer_config) = buffer_config {
+            activated = true;
             let mut activate_context = self.make_activate_context();
             success = permit_alloc(|| {
                 plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
@@ -2094,17 +2102,22 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
 
         if !success {
-            let restored = permit_alloc(|| unsafe {
-                state::deserialize_object::<P>(
-                    &mut previous,
-                    self.params.clone(),
-                    state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
-                    buffer_config.as_ref(),
-                )
+            let restored = permit_alloc(|| {
+                state::as_rollback(|| unsafe {
+                    state::deserialize_object::<P>(
+                        &mut previous,
+                        self.params.clone(),
+                        state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
+                        buffer_config.as_ref(),
+                    )
+                })
             });
             let mut reactivated = restored;
             // A `let` chain since the 0.4.2 refresh, as above.
-            if restored && let Some(buffer_config) = buffer_config {
+            if restored
+                && activated
+                && let Some(buffer_config) = buffer_config
+            {
                 let mut activate_context = self.make_activate_context();
                 reactivated = permit_alloc(|| {
                     plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
@@ -2119,7 +2132,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
         }
         drop(plugin);
-        self.state_transaction_active.store(false, Ordering::SeqCst);
+        self.state_transactions.fetch_add(1, Ordering::SeqCst);
 
         crate::nice_debug_assert!(
             success,
@@ -2757,6 +2770,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 }
 
                 let result = if buffer_is_valid {
+                    let transactions = wrapper.state_transactions.load(Ordering::SeqCst);
                     let Some(mut plugin) = wrapper.plugin.try_lock() else {
                         // MXM PATCH (defect 8, refreshed onto 0.4.2): a GUI or host state load
                         // holds this lock on purpose for its whole rollback-capable transaction.
@@ -2766,7 +2780,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                         // the plugin failed — MXM Player then holds it failed until a reset — when
                         // it is only loading a preset. The load resets the plugin, so a note-off
                         // skipped here cannot leave a note hanging.
-                        if wrapper.state_transaction_active.load(Ordering::SeqCst) {
+                        if crate::wrapper::state::transaction_interfered(
+                            transactions,
+                            wrapper.state_transactions.load(Ordering::SeqCst),
+                        ) {
                             // SAFETY: `process` is this call's host buffer.
                             unsafe { silence_outputs_from(process, block_start) };
                             return CLAP_PROCESS_CONTINUE;

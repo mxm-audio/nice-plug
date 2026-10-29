@@ -143,20 +143,26 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// then do the block splitting based on that. Note events need to have their timing adjusted to
     /// match the block start, since they're all read upfront.
     pub process_events: AtomicRefCell<Vec<ProcessEvent<P>>>,
-    /// MXM PATCH (defect 8, ported to VST3): set while a state transaction holds the plugin lock,
-    /// so a `process()` call meanwhile outputs silence and carries on rather than reporting an
-    /// error the host may hold against the plugin.
-    pub state_transaction_active: AtomicBool,
+    /// MXM PATCH (defect 8, ported to VST3): counts each state transaction's start and end, so it is
+    /// odd while one runs. `process()` reads it before and after a `try_lock()` that fails: odd, or
+    /// moved, and the lock was a transaction's, so the block outputs silence and carries on rather
+    /// than reporting an error the host may hold against the plugin.
+    pub state_transactions: AtomicU64,
     /// Whether the host has the plugin active (`IComponent::setActive`): a state transaction
     /// reactivates it only then.
     pub is_active: AtomicBool,
-    /// MXM PATCH (suspended processing): when the last `process()` call began, in nanoseconds since
-    /// [`epoch`][Self::epoch], 0 before the first. A host may keep a plugin processing and run no
-    /// block for it (DaVinci Resolve, 2026-10-29), so an edit is applied here, not left for a block
-    /// to bring, once none has come for [`PROCESS_STALL`].
-    pub last_process_nanos: AtomicU64,
-    /// The instant [`last_process_nanos`][Self::last_process_nanos] counts from.
-    pub epoch: Instant,
+    /// MXM PATCH (suspended processing): set while a `process()` call runs ([`InProcess`]).
+    pub in_process: AtomicBool,
+    /// MXM PATCH (suspended processing): set while a thread other than the audio thread applies
+    /// pending edits, which [`InProcess::begin`] waits out.
+    pub applying_edits: AtomicBool,
+    /// MXM PATCH (suspended processing): per parameter, in `param_hashes`' order, an edit made
+    /// while the host had the plugin processing and not yet applied ([`pending`]), or 0.
+    pub pending_edits: Vec<AtomicU64>,
+    /// Whether a slot of `pending_edits` may be set.
+    pub edits_pending: AtomicBool,
+    /// Each parameter's place in `param_hashes`.
+    pub param_index_by_hash: HashMap<u32, usize>,
 
     /// The keys from `param_map` in a stable order.
     pub param_hashes: Vec<u32>,
@@ -297,10 +303,16 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             }
         }
 
-        let param_hashes = param_id_hashes_ptrs_groups
+        let param_hashes: Vec<u32> = param_id_hashes_ptrs_groups
             .iter()
             .map(|(_, hash, _, _)| *hash)
             .collect();
+        let param_index_by_hash = param_hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| (*hash, index))
+            .collect();
+        let pending_edits = param_hashes.iter().map(|_| AtomicU64::new(0)).collect();
         let param_by_hash = param_id_hashes_ptrs_groups
             .iter()
             .map(|(_, hash, ptr, _)| (*hash, *ptr))
@@ -373,10 +385,13 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             input_note_events,
             note_expression_controller: AtomicRefCell::new(NoteExpressionController::default()),
             process_events: AtomicRefCell::new(Vec::with_capacity(P::INPUT_EVENT_CAPACITY)),
-            state_transaction_active: AtomicBool::new(false),
+            state_transactions: AtomicU64::new(0),
             is_active: AtomicBool::new(false),
-            last_process_nanos: AtomicU64::new(0),
-            epoch: Instant::now(),
+            in_process: AtomicBool::new(false),
+            applying_edits: AtomicBool::new(false),
+            pending_edits,
+            edits_pending: AtomicBool::new(false),
+            param_index_by_hash,
 
             param_hashes,
             param_by_hash,
@@ -639,25 +654,51 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
     }
 
-    /// MXM PATCH (suspended processing): whether the host will bring an edit to the processor in a
-    /// block: it has the plugin processing and has run one within [`PROCESS_STALL`]. Otherwise the
-    /// edit is applied where it is made.
-    pub fn host_delivers_edits(&self) -> bool {
-        self.is_processing.load(Ordering::SeqCst)
-            && ran_recently(
-                self.last_process_nanos.load(Ordering::Relaxed),
-                self.nanos_now(),
-            )
+    /// MXM PATCH (suspended processing): an edit to a parameter from the editor or the host's
+    /// controller. Upstream applied it only while the host did not have the plugin processing, and
+    /// otherwise left it for a block to bring; a host that keeps the plugin processing and runs no
+    /// block (DaVinci Resolve with an idle track, REAPER with a bypassed plugin) never applied it,
+    /// and the editor showed the edit undone. Now, while processing, it is a pending slot, applied
+    /// here unless a `process()` call is running, and otherwise by that call as it ends
+    /// ([`InProcess`]): applied either way, never by this thread during a call. The host's own copy,
+    /// if it brings one, sets the same value again.
+    pub fn set_or_defer(&self, hash: u32, normalized_value: f32) -> tresult {
+        if !self.is_processing.load(Ordering::SeqCst) {
+            return self.set_normalized_value_by_hash(hash, normalized_value, self.sample_rate());
+        }
+        let Some(&index) = self.param_index_by_hash.get(&hash) else {
+            return kInvalidArgument;
+        };
+        if !normalized_value.is_finite() {
+            return kInvalidArgument;
+        }
+        self.pending_edits[index].store(pending(normalized_value), Ordering::SeqCst);
+        self.edits_pending.store(true, Ordering::SeqCst);
+        // Dekker's handshake with `InProcess::begin`: of the two flags, at least one thread sees
+        // the other's set, so this thread applies only where no call has begun.
+        self.applying_edits.store(true, Ordering::SeqCst);
+        if !self.in_process.load(Ordering::SeqCst) {
+            self.apply_pending_edits();
+        }
+        self.applying_edits.store(false, Ordering::SeqCst);
+        kResultOk
     }
 
-    /// Notes that a `process()` call began.
-    pub fn note_process(&self) {
-        self.last_process_nanos
-            .store(self.nanos_now().max(1), Ordering::Relaxed);
+    /// Applies each pending edit once, whichever thread takes it.
+    pub fn apply_pending_edits(&self) {
+        if !self.edits_pending.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let sample_rate = self.sample_rate();
+        for (slot, &hash) in self.pending_edits.iter().zip(&self.param_hashes) {
+            if let Some(value) = taken(slot.swap(0, Ordering::SeqCst)) {
+                self.set_normalized_value_by_hash(hash, value, sample_rate);
+            }
+        }
     }
 
-    fn nanos_now(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    fn sample_rate(&self) -> Option<f32> {
+        self.current_buffer_config.load().map(|c| c.sample_rate)
     }
 
     /// Immediately set the plugin state, as one transaction: `false`, with the previous state
@@ -682,9 +723,9 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         // Made before the lock and dropped after it, as `setActive()` does: dropping it may ask
         // the host for a restart, which a host may answer at once by taking the lock.
         let mut activate_context = self.make_activate_context();
-        self.state_transaction_active.store(true, Ordering::SeqCst);
+        self.state_transactions.fetch_add(1, Ordering::SeqCst);
         let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
-            self.state_transaction_active.store(false, Ordering::SeqCst);
+            self.state_transactions.fetch_add(1, Ordering::SeqCst);
             crate::nice_error!("Failed to load state: could not acquire the plugin lock");
             return false;
         };
@@ -702,7 +743,11 @@ impl<P: Vst3Plugin> WrapperInner<P> {
                 buffer_config.as_ref(),
             )
         });
+        // Whether the requested state was activated: only then does a rollback reactivate. A state
+        // refused before it would otherwise rebuild a working engine that never changed.
+        let mut activated = false;
         if success && let Some(buffer_config) = reactivate {
+            activated = true;
             success = permit_alloc(|| {
                 plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
             });
@@ -711,16 +756,21 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             }
         }
         if !success {
-            let restored = permit_alloc(|| unsafe {
-                state::deserialize_object::<P>(
-                    &mut previous,
-                    self.params.clone(),
-                    state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
-                    buffer_config.as_ref(),
-                )
+            let restored = permit_alloc(|| {
+                state::as_rollback(|| unsafe {
+                    state::deserialize_object::<P>(
+                        &mut previous,
+                        self.params.clone(),
+                        state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
+                        buffer_config.as_ref(),
+                    )
+                })
             });
             let mut reactivated = restored;
-            if restored && let Some(buffer_config) = reactivate {
+            if restored
+                && activated
+                && let Some(buffer_config) = reactivate
+            {
                 // No reset: a rejected state must be observationally absent, as in the CLAP
                 // wrapper, and the working engine keeps its history.
                 reactivated = permit_alloc(|| {
@@ -730,7 +780,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
         }
         drop(plugin);
-        self.state_transaction_active.store(false, Ordering::SeqCst);
+        self.state_transactions.fetch_add(1, Ordering::SeqCst);
         drop(activate_context);
 
         crate::nice_debug_assert!(
@@ -764,15 +814,49 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     }
 }
 
-/// MXM PATCH (suspended processing): how long without a `process()` call before an edit is applied
-/// where it is made rather than left for a block to bring. Far longer than any host's block, so a
-/// host that is running blocks always brings the edits itself.
-pub const PROCESS_STALL: Duration = Duration::from_millis(250);
+/// MXM PATCH (suspended processing): a `process()` call, from its first statement to its last,
+/// early returns included. Begun, it waits out an edit another thread is applying, then applies
+/// the pending ones; ended, it applies those made during the call, after clearing `in_process`, so
+/// an edit made as the call ends is applied by one side or the other.
+pub(crate) struct InProcess<'a, P: Vst3Plugin>(&'a WrapperInner<P>);
 
-/// Whether a block began, at `last` nanoseconds (0 for none yet), within [`PROCESS_STALL`] of
-/// `now`.
-fn ran_recently(last: u64, now: u64) -> bool {
-    last != 0 && now.saturating_sub(last) < PROCESS_STALL.as_nanos() as u64
+/// How many times [`InProcess::begin`] spins on an edit another thread is applying: that is a few
+/// atomic writes, so only a preempted thread outlasts it, and the call then goes on rather than
+/// wait on the audio thread.
+const APPLYING_SPINS: u32 = 10_000;
+
+impl<'a, P: Vst3Plugin> InProcess<'a, P> {
+    pub fn begin(inner: &'a WrapperInner<P>) -> Self {
+        inner.in_process.store(true, Ordering::SeqCst);
+        for _ in 0..APPLYING_SPINS {
+            if !inner.applying_edits.load(Ordering::SeqCst) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        inner.apply_pending_edits();
+        Self(inner)
+    }
+}
+
+impl<P: Vst3Plugin> Drop for InProcess<'_, P> {
+    fn drop(&mut self) {
+        self.0.in_process.store(false, Ordering::SeqCst);
+        self.0.apply_pending_edits();
+    }
+}
+
+/// The flag marking a pending edit's slot.
+const PENDING: u64 = 1 << 32;
+
+/// `value` as a pending edit's slot.
+fn pending(value: f32) -> u64 {
+    PENDING | u64::from(value.to_bits())
+}
+
+/// A slot's pending edit, if any.
+fn taken(slot: u64) -> Option<f32> {
+    (slot & PENDING != 0).then(|| f32::from_bits(slot as u32))
 }
 
 impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
@@ -847,15 +931,16 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
 mod tests {
     use super::*;
 
-    /// **A host that runs no block for a while no longer brings the edits** (suspended
-    /// processing): none yet, or the last more than [`PROCESS_STALL`] ago, and the edit is the
-    /// editor's to apply.
+    /// **A pending edit is its value, taken once** (suspended processing): every value, 0.0 and
+    /// the extremes included, round-trips, and an empty slot holds none.
     #[test]
-    fn a_stalled_host_brings_no_edits() {
-        let stall = PROCESS_STALL.as_nanos() as u64;
-        assert!(!ran_recently(0, 5), "no block yet");
-        assert!(ran_recently(1_000, 1_000 + stall - 1));
-        assert!(!ran_recently(1_000, 1_000 + stall));
-        assert!(ran_recently(1_000, 500), "a clock read before the block");
+    fn a_pending_edit_is_its_value() {
+        for value in [0.0f32, 0.25, 1.0, -0.0, f32::MIN_POSITIVE] {
+            assert_eq!(
+                taken(pending(value)).map(f32::to_bits),
+                Some(value.to_bits())
+            );
+        }
+        assert_eq!(taken(0), None);
     }
 }

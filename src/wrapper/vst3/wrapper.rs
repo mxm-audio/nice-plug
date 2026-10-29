@@ -40,7 +40,7 @@ use vst3::Steinberg::{
 use vst3::{Class, ComRef};
 use widestring::U16CStr;
 
-use super::inner::{ProcessEvent, WrapperInner};
+use super::inner::{InProcess, ProcessEvent, WrapperInner};
 use super::note_expressions;
 use super::util::{VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START, u16strlcpy};
 use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
@@ -444,6 +444,10 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                                     );
 
                                     result = kResultOk;
+                                    // MXM PATCH (defect 8, ported to VST3): before the activation
+                                    // context is dropped below, which may make the host deactivate
+                                    // the plugin at once; that must be the state left.
+                                    self.inner.is_active.store(true, Ordering::SeqCst);
 
                                     break;
                                 } else if now_2.elapsed() > Duration::from_secs(1) {
@@ -469,9 +473,6 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 // NOTE: This needs to be dropped after the `plugin` lock to avoid deadlocks
                 drop(activate_context);
 
-                if result == kResultOk {
-                    self.inner.is_active.store(true, Ordering::SeqCst);
-                }
                 result
             }
             (true, None) => kResultFalse,
@@ -771,20 +772,9 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
     }
 
     unsafe fn setParamNormalized(&self, id: ParamID, value: ParamValue) -> tresult {
-        // If the plugin is currently processing audio, then this parameter change will also be sent
-        // to the process function. MXM PATCH (suspended processing): only while the host runs
-        // blocks; a host that keeps the plugin processing and runs none would leave it unapplied.
-        if self.inner.host_delivers_edits() {
-            return kResultOk;
-        }
-
-        let sample_rate = self
-            .inner
-            .current_buffer_config
-            .load()
-            .map(|c| c.sample_rate);
-        self.inner
-            .set_normalized_value_by_hash(id, value as f32, sample_rate)
+        // MXM PATCH (suspended processing): upstream ignored this while the plugin was processing,
+        // for a block to bring the change; a host that runs no block left it unapplied.
+        self.inner.set_or_defer(id, value as f32)
     }
 
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
@@ -1072,7 +1062,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         // Panic on allocations if the `assert_process_allocs` feature has been enabled, and make
         // sure that FTZ is set up correctly
         process_wrapper(|| {
-            self.inner.note_process();
+            let _in_process = InProcess::begin(&self.inner);
 
             // We need to handle incoming automation first
             let data = unsafe { &*data };
@@ -1598,6 +1588,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                     let result = if buffer_is_valid {
                         // In the case the host misbehaves and tries to activate/deactive the plugin while the
                         // process loop is still running, just return an error.
+                        let transactions = self.inner.state_transactions.load(Ordering::SeqCst);
                         if let Some(mut plugin) = self.inner.plugin.try_lock() {
                             let mut aux = AuxiliaryBuffers {
                                 inputs: buffers.aux_inputs,
@@ -1617,7 +1608,10 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                 plugin.process(buffers.main_buffer, &mut aux, &mut context);
                             self.inner.last_process_status.store(result);
                             result
-                        } else if self.inner.state_transaction_active.load(Ordering::SeqCst) {
+                        } else if crate::wrapper::state::transaction_interfered(
+                            transactions,
+                            self.inner.state_transactions.load(Ordering::SeqCst),
+                        ) {
                             // MXM PATCH (defect 8, ported to VST3): a state load holds the lock
                             // on purpose; this block is silence and the host carries on, as in
                             // the CLAP wrapper. The load resets the plugin.

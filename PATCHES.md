@@ -827,12 +827,25 @@ the fixes for the state paths already (defect 8, *GUI-authored state dirty*); th
   plugin active), and a refused state (defects 9 and 11) or failed activation rolled back whole.
   Upstream wrote parameters and fields first and returned `false`, leaving a mix. The activation
   context is dropped after the lock, as `setActive()` does: its latency request may make the host
-  take the lock at once. A `process()` call meanwhile outputs silence and returns `kResultOk`.
-- **Suspended processing** (`host_delivers_edits`): an editor's edit and the host's
+  take the lock at once. A `process()` call meanwhile outputs silence and returns `kResultOk`: the
+  transactions are counted at start and end (`state_transactions`, odd while one runs) and read
+  before and after a failed `try_lock()`, so one that has just ended is still told from a host's
+  misuse (`state::transaction_interfered`; the CLAP wrapper too). A rollback reactivates only when
+  the requested state was activated, so a state refused while deserializing leaves the working
+  engine untouched (the CLAP wrapper too), and runs under `as_rollback`, so a field's `set()` can
+  tell it undoes the attempt (`rolling_back`). `is_active` is set before `setActive()` drops its
+  activation context, whose restart may deactivate the plugin at once.
+- **Suspended processing** (`set_or_defer`, `InProcess`): an editor's edit and the host's
   `setParamNormalized` were applied only through a block while the host had the plugin processing;
-  with none coming, the value never changed and the editor showed the edit undone. They are applied
-  where they are made once no block has begun for `PROCESS_STALL` (250 ms), far longer than any
-  host's block. Upstream's own FIXME named REAPER, which stops processing a bypassed plugin.
+  with none coming, the value never changed and the editor showed the edit undone. Now, while
+  processing, each is a pending slot per parameter, applied where it is made unless a `process()`
+  call is running, and otherwise by that call as it ends: `InProcess` clears `in_process`, then
+  applies the slots, so an edit is applied by one side or the other and never by another thread
+  during a call. Dekker's handshake (`applying_edits` against `in_process`) keeps a call from
+  starting while another thread applies; it spins on that at most `APPLYING_SPINS` times rather
+  than wait on the audio thread. Upstream's own FIXME named REAPER, which stops processing a bypassed
+  plugin. A time-based fallback, tried first, was dropped in review: a past block says nothing about
+  the next one, and a long block outlasted it.
 - **Process mode** (`setupProcessing`): the buffer configuration was stored before the setup's mode
   was read, so each activation ran in the previous setup's mode.
 - **Aux buses** (`process`, `setBusArrangements`): an aux input was bounded by `numOutputs` with
@@ -840,6 +853,9 @@ the fixes for the state paths already (defect 8, *GUI-authored state dirty*); th
   aux output by `numOutputs`, with `>=`. The arrangement check took the main bus for the first aux
   bus; aux buses follow the main one, as `getBusInfo()` numbers them.
 
-Tests: `wrapper::vst3::inner::tests::a_stalled_host_brings_no_edits`; mxm-fx-eq-n's host test
-`a_restore_that_reads_back_changed_keeps_its_bands` runs its VST3 through `mxm-vst3-host`: a taken
-id, older view settings and learn accepted, and a state a field refuses rolled back whole.
+Tests: `wrapper::vst3::inner::tests::a_pending_edit_is_its_value`,
+`wrapper::state::tests::a_rollback_is_marked_while_it_runs` and
+`a_failed_lock_is_a_transactions_when_the_count_was_odd_or_moved`. mxm-fx-eq-n's host tests run its
+CLAP and its VST3 (through `mxm-vst3-host`): `a_restore_that_reads_back_changed_keeps_its_bands`, a
+taken id, older view settings and learn accepted and a state a field refuses rolled back whole; and
+`a_refused_state_leaves_the_sound_as_it_was`, the render after a refused state equal to the bit.

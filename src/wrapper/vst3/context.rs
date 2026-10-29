@@ -416,21 +416,12 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
         match &*inner.component_handler.borrow() {
             Some(handler) => match inner.param_ptr_to_hash.get(&param) {
                 Some(hash) => {
-                    // Only update the parameters manually if the host is not processing audio. If
-                    // the plugin is currently processing audio, the host will pass this change back
-                    // to the plugin in the audio callback. This also prevents the values from
-                    // changing in the middle of the process callback, which would be unsound.
-                    // MXM PATCH (suspended processing): REAPER stops processing a bypassed
-                    // plugin and DaVinci Resolve an idle track's while it stays processing, so a
-                    // host that has run no block for a while does not bring the edit: it is set
-                    // here (`WrapperInner::host_delivers_edits`).
-                    if !inner.host_delivers_edits() {
-                        inner.set_normalized_value_by_hash(
-                            *hash,
-                            normalized,
-                            inner.current_buffer_config.load().map(|c| c.sample_rate),
-                        );
-                    }
+                    // MXM PATCH (suspended processing): upstream set the value here only while
+                    // the host was not processing and otherwise left it for a block to bring,
+                    // which a host that keeps the plugin processing and runs no block never did
+                    // (DaVinci Resolve, REAPER). `set_or_defer` applies it here or as the running
+                    // call ends, never during one.
+                    inner.set_or_defer(*hash, normalized);
 
                     unsafe { handler.performEdit(*hash, normalized as f64) };
                 }
