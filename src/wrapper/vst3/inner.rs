@@ -726,13 +726,41 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         true
     }
 
-    /// Drops the pending edits: a state loaded supersedes the edits made before it. Only after a
-    /// load succeeded; a refused one keeps them.
-    fn drop_pending_edits(&self) {
+    /// Takes the pending edits out of their slots as a state transaction begins: the state it loads
+    /// supersedes them if it loads, and [`restore_pending_edits`][Self::restore_pending_edits] puts
+    /// them back if it is refused. An edit made while it runs stays in its slot, and is applied
+    /// after (VST3 review, 2026-10-29).
+    fn take_pending_edits(&self) -> Vec<u64> {
         self.edits_pending.store(false, Ordering::SeqCst);
-        for slot in &self.pending_edits {
-            slot.store(0, Ordering::SeqCst);
+        self.pending_edits
+            .iter()
+            .map(|slot| slot.swap(0, Ordering::SeqCst))
+            .collect()
+    }
+
+    /// A refused transaction's pending edits back in their slots, each unless its parameter has a
+    /// newer one there.
+    fn restore_pending_edits(&self, taken: Vec<u64>) {
+        let mut restored = false;
+        for (slot, edit) in self.pending_edits.iter().zip(taken) {
+            if edit != 0
+                && slot
+                    .compare_exchange(0, edit, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                restored = true;
+            }
         }
+        if restored {
+            self.edits_pending.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A state transaction's end, on every path, a refusal's too: counted out, then the pending
+    /// edits applied if no call runs, a refused load's and those made while it ran.
+    fn finish_state_transaction(&self) {
+        self.state_transactions.fetch_add(1, Ordering::SeqCst);
+        self.apply_pending_edits_if_idle();
     }
 
     /// Immediately set the plugin state, as one transaction: `false`, with the previous state
@@ -759,15 +787,16 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         let mut activate_context = self.make_activate_context();
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
         if !self.appliers_drained() {
-            self.state_transactions.fetch_add(1, Ordering::SeqCst);
+            self.finish_state_transaction();
             crate::nice_error!("Failed to load state: an edit was still being applied");
             return false;
         }
         let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
-            self.state_transactions.fetch_add(1, Ordering::SeqCst);
+            self.finish_state_transaction();
             crate::nice_error!("Failed to load state: could not acquire the plugin lock");
             return false;
         };
+        let earlier_edits = self.take_pending_edits();
         // The attempt and its rollback under one number (`state::state_transaction`).
         let transaction = state::TransactionScope::begin();
         let mut previous = permit_alloc(|| unsafe {
@@ -820,15 +849,13 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             }
             crate::nice_debug_assert!(restored && reactivated, "Rolling back plugin state failed");
         }
-        if success {
-            self.drop_pending_edits();
+        if !success {
+            self.restore_pending_edits(earlier_edits);
         }
         drop(transaction);
         drop(plugin);
-        self.state_transactions.fetch_add(1, Ordering::SeqCst);
+        self.finish_state_transaction();
         drop(activate_context);
-        // Edits a refused load kept are applied now, if no call runs; so is one made meanwhile.
-        self.apply_pending_edits_if_idle();
 
         crate::nice_debug_assert!(
             success,

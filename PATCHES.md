@@ -852,8 +852,10 @@ the fixes for the state paths already (defect 8, *GUI-authored state dirty*); th
   values are atomics: an edit then lands within the block, as a sample-accurate host change does).
   A state transaction supersedes the edits made before it: counted in first, it waits the appliers
   out (and is refused, touching nothing, if one is still applying after a second), takes the lock,
-  and drops the pending slots only once the state has loaded; a refused load keeps them and applies
-  them after. No edit is applied while it runs (`appliers` against `state_transactions`). Upstream's own FIXME named REAPER, which stops processing a bypassed
+  and takes the pending edits out of their slots: superseded if the state loads, put back (each
+  unless a newer edit took its slot) if it is refused. An edit made while it runs stays in its slot.
+  No edit is applied while it runs (`appliers` against `state_transactions`), and every path out,
+  a refusal's too, applies the pending edits if no call runs (`finish_state_transaction`). Upstream's own FIXME named REAPER, which stops processing a bypassed
   plugin. A time-based fallback, tried first, was dropped in review: a past block says nothing about
   the next one, and a long block outlasted it.
 - **Process mode** (`setupProcessing`): the buffer configuration was stored before the setup's mode
