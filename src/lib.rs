@@ -84,7 +84,8 @@
 
 pub use nice_plug_core::*;
 
-// MXM PATCH (*Host keys*)
+// MXM PATCH (*Host keys*): an editor's, so behind `editor`, as the VST3 view that offers the keys is.
+#[cfg(feature = "editor")]
 pub mod host_keys;
 /// Everything you'll need to use nice-plug. Import this with `use nice_plug::prelude::*;`.
 pub mod prelude;

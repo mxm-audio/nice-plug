@@ -769,7 +769,10 @@ was attached to and offers each `onKeyDown`/`onKeyUp` there first, as a `HostKey
 an uppercase ASCII character from `keyCode >= 128`, or from `key` when `keyCode` is 0), answering
 `kResultTrue` if the receiver takes it and `kResultFalse` if not; with no receiver, upstream's
 virtual-key path runs. Declined keys stay the host's: Live then plays them, or starts its transport.
-nice-plug-egui's fork registers the receiver (its *Host keys*).
+nice-plug-egui's fork registers the receiver (its *Host keys*), and asks for the `editor` feature:
+`host_keys` is behind it, as the VST3 view is, because it names the editor module's types. A build
+without `editor` has neither (2026-11-03: MXM Player's `nice-plug-output-fixture`, built with
+`default-features = false`, failed on the module until then).
 
 **Regression tests:** `host_keys::tests` (registration, latest wins, gone with its handle) and
 `wrapper::vst3::view::host_key_tests` (Live's codes, virtual keys, the keys that are none).
@@ -805,9 +808,7 @@ discovery nor `preset-load`.
 test indexer and receiver, the folder asked for by the plugin's id and version; the folder rule with `..`, a subfolder and a missing file) and
 `mxm_preset_load_tests` (only a plugin with a loader offers the extension; a load reaches the
 loader and the host hears `loaded`; a refusal and a location that isn't a file reach the host's
-`on_error` with why). `cargo check --no-default-features` fails on `src/host_keys.rs`, which
-predates this patch (the *Host keys* capability imports the editor module unconditionally); the
-presets patch builds with and without `editor`.
+`on_error` with why). The presets patch builds with and without `editor`.
 
 ## The VST3 wrapper in DaVinci Resolve — fixes (2026-10-29)
 
