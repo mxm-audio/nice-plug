@@ -32,10 +32,14 @@ use vst3::{ComPtr, ComRef};
 
 use super::context::{WrapperActivateContext, WrapperProcessContext};
 use super::note_expressions::NoteExpressionController;
+// MXM PATCH (outputs in use)
+use super::outputs_in_use::{IOutputsInUseHandler, tell_changed};
 use super::param_units::ParamUnits;
 use super::util::{VST3_MIDI_PARAMS_END, VST3_MIDI_PARAMS_START};
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::util::permit_alloc;
+// MXM PATCH (outputs in use)
+use crate::wrapper::outputs_in_use::UsedOutputs;
 use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::BufferManager;
 use crate::wrapper::util::hash_param_id;
@@ -73,6 +77,11 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// The host's [`IComponentHandler`] instance, if passed through
     /// [`IEditController::set_component_handler`].
     pub component_handler: AtomicRefCell<Option<ComPtr<IComponentHandler>>>,
+
+    /// MXM PATCH (outputs in use): what the plugin says it sends to, served through
+    /// `IOutputsInUse`, and whether the host's `IOutputsInUseHandler` must be told; `None` for a
+    /// plugin that doesn't say.
+    pub outputs_in_use: Option<UsedOutputs>,
 
     /// Our own [`IPlugView`] instance.
     #[cfg(feature = "editor")]
@@ -207,6 +216,9 @@ pub enum Task<P: Plugin> {
     RequestResize { size: Size, scale_factor: f64 },
     #[cfg(feature = "editor")]
     CallMainThread,
+    /// MXM PATCH (outputs in use): read the outputs in use again, and tell the host if they
+    /// changed.
+    OutputsInUseChanged,
 }
 
 /// VST3 makes audio processing pretty complicated. In order to support both block splitting for
@@ -336,6 +348,11 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             .map(|(_, hash, ptr, _)| (ptr, hash))
             .collect();
 
+        // MXM PATCH (outputs in use): asked once, as the CLAP wrapper does; an output's place among
+        // the outputs is its VST3 output bus index.
+        let outputs_in_use = Vst3Plugin::outputs_in_use(&plugin)
+            .map(|source| UsedOutputs::new(source, &param_id_to_hash, Some));
+
         let input_note_events = if P::MIDI_INPUT == MidiConfig::None {
             AtomicRefCell::new(VecDeque::new())
         } else {
@@ -353,6 +370,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             editor_window: Arc::new(AtomicRefCell::new(None)),
 
             component_handler: AtomicRefCell::new(None),
+            outputs_in_use,
 
             #[cfg(feature = "editor")]
             plug_view: RwLock::new(None),
@@ -583,6 +601,14 @@ impl<P: Vst3Plugin> WrapperInner<P> {
                             "The task queue is full, dropping task..."
                         );
                     }
+                    // MXM PATCH (outputs in use): a parameter they depend on.
+                    if self
+                        .outputs_in_use
+                        .as_ref()
+                        .is_some_and(|in_use| in_use.depends_on(hash))
+                    {
+                        self.outputs_in_use_touched();
+                    }
                 }
 
                 kResultOk
@@ -622,6 +648,9 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     pub fn set_state_object_from_gui(&self, mut state: PluginState) {
         if state::gui_state_is_dirty_only(&state, &self.params.serialize_fields()) {
             self.mark_dirty();
+            // MXM PATCH (outputs in use): a persistent field it published may name what plays on
+            // an output.
+            self.outputs_in_use_touched();
             return;
         }
         if self.set_state_inner(&mut state) {
@@ -896,8 +925,51 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             let task_posted = self.schedule_gui(Task::StateChanged);
             crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
         }
+        // MXM PATCH (outputs in use): a state may route a part elsewhere.
+        self.outputs_in_use_touched();
 
         success
+    }
+
+    /// MXM PATCH (outputs in use): something that may route a part elsewhere, or rename what plays
+    /// on an output, changed, on any thread. Raises the flag and posts the check, which a posted
+    /// task runs only on the main thread ([`check_outputs_in_use()`][Self::check_outputs_in_use]).
+    /// On the main thread the check runs at once even with the flag already raised: a task run
+    /// elsewhere (Linux runs one posted from the audio thread on a background thread) leaves it
+    /// raised, and this, the next task here or the host's next `setParamNormalized` takes it.
+    pub fn outputs_in_use_touched(&self) {
+        let Some(in_use) = &self.outputs_in_use else {
+            return;
+        };
+        if in_use.raise() || self.is_main_thread() {
+            // A full queue leaves the flag raised, for the next check.
+            let _ = self.schedule_gui(Task::OutputsInUseChanged);
+        }
+    }
+
+    /// MXM PATCH (outputs in use): on the main thread, tells the host if a raised change changed
+    /// the outputs in use or their names, through its handler's `IOutputsInUseHandler`. Anywhere
+    /// else it does nothing and leaves the flag raised.
+    pub fn check_outputs_in_use(&self) {
+        if !self.is_main_thread() {
+            return;
+        }
+        if let Some(in_use) = &self.outputs_in_use
+            && in_use.check()
+            && let Some(handler) = &*self.component_handler.borrow()
+            && let Some(handler) = handler.cast::<IOutputsInUseHandler>()
+        {
+            tell_changed(&handler);
+        }
+    }
+
+    /// MXM PATCH (outputs in use): whether this is the thread the wrapper was made on, the host's
+    /// UI thread.
+    fn is_main_thread(&self) -> bool {
+        self.event_loop
+            .borrow()
+            .as_ref()
+            .is_some_and(|event_loop| event_loop.is_main_thread())
     }
 
     /// MXM PATCH (defect 8, ported to VST3): wait for the plugin's `TryLock` off the audio thread,
@@ -1044,7 +1116,12 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                         .host_main_thread_callback(&editor_window.window)
                 }
             }
+            // MXM PATCH (outputs in use): checked below, as after every task.
+            Task::OutputsInUseChanged => {}
         }
+        // MXM PATCH (outputs in use): after every task, so a check a full queue or another thread
+        // left undone still runs, on the main thread only.
+        self.check_outputs_in_use();
     }
 }
 

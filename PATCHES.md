@@ -3,7 +3,7 @@
 **Since 2026-10-06 this is `nice-plug 0.4.2` exactly as published on crates.io**, plus the MXM
 patches that 0.4.2 has not made redundant: seven of the eleven numbered fixes (1, 2, 7, 8, 9, 10 and
 11; 1, 2 and 8 reworked for 0.4.2) and the capability changes: note names on 2026-10-14, floating
-windows' `set_transient` on 2026-10-15, host keys on 2026-10-16, presets on 2026-10-27; and one lint, an `allow` on upstream's
+windows' `set_transient` on 2026-10-15, host keys on 2026-10-16, presets on 2026-10-27, outputs in use on 2026-11-19; and one lint, an `allow` on upstream's
 `vst3` test casts that Clippy 1.98 refuses (`MXM PATCH (lint)`). Fixes 3, 4, 5 and 6 were dropped because 0.4.2 does the same thing. The numbering is unchanged, so every older reference
 still resolves. See [*Refresh to 0.4.2*](#refresh-to-042--2026-10-06) for the per-patch status.
 
@@ -14,14 +14,14 @@ root `Cargo.toml`.
 Every change is marked `MXM PATCH` in the source, so `grep -rn "MXM PATCH" src/` finds the complete
 delta. Since the 0.4.2 refresh it lives in `src/wrapper/clap/wrapper.rs`, `src/wrapper/state.rs`
 and the one re-export in `src/wrapper.rs`; the note names add `src/wrapper/clap.rs`,
-`src/wrapper/clap/note_names.rs` and `src/prelude.rs`; the presets add `src/wrapper/clap/presets.rs`. Hunks reworked by the refresh say
+`src/wrapper/clap/note_names.rs` and `src/prelude.rs`; the presets add `src/wrapper/clap/presets.rs`; the outputs in use add `src/wrapper/outputs_in_use.rs`, `src/wrapper/clap/outputs_in_use.rs`, `src/wrapper/vst3/outputs_in_use.rs`, and hunks in `src/wrapper/vst3.rs`, `src/wrapper/vst3/inner.rs` and `src/wrapper/vst3/wrapper.rs`. Hunks reworked by the refresh say
 `refreshed onto 0.4.2` in their marker. *(0.3.0, superseded: it lived in
 `src/wrapper/clap/wrapper.rs` and `src/wrapper/state.rs`, plus the output-push guard in
 `src/wrapper/clap/context.rs`. 0.4 removed the wrapper's output queue that the guard bounded.)*
 
 **The four capabilities are different in kind from the eleven** — they are not defect fixes. See
-*GUI-authored state dirty*, *Floating windows*, *GUI-task process wake*, *Note names* and
-*Host keys*, below.
+*GUI-authored state dirty*, *Floating windows*, *GUI-task process wake*, *Note names*,
+*Host keys*, *Presets* and *Outputs in use*, below.
 
 ## Refresh to 0.4.2 — 2026-10-06
 
@@ -809,6 +809,71 @@ test indexer and receiver, the folder asked for by the plugin's id and version; 
 `mxm_preset_load_tests` (only a plugin with a loader offers the extension; a load reaches the
 loader and the host hears `loaded`; a refusal and a location that isn't a file reach the host's
 `on_error` with why). The presets patch builds with and without `editor`.
+
+## Outputs in use — a capability, not a fix
+
+*Added 2026-11-19, VST3 on 2026-11-20.* A drum machine routes each slot to main or to an output of
+its own, and no host can learn which: CLAP and VST3 both let a host tell a plugin which outputs it
+listens to (`audio-ports-activation`, `IComponent::activateBus`), never the other way round. So
+newDAWn gave every output a track by hand, all silent until the slots were routed in the plugin as
+well (the owner, 2026-11-19: "Can we make it automatic, if the drum machine opens an individual
+out, then it makes a group in the daw?"; 2026-11-20, of VST3: "yes, add the VST3 version too").
+This patch serves it in both formats: the CLAP extension `dk.mxm.outputs-in-use/1`, and the VST3
+interfaces `IOutputsInUse` (on the component) and `IOutputsInUseHandler` (on the host's
+`IComponentHandler`). Their convention is mxm-kit's `docs/plugin-conventions.md`, *Outputs in use*.
+
+**The API**, in `src/wrapper/outputs_in_use.rs` and the prelude: `ClapPlugin::outputs_in_use()`
+and `Vst3Plugin::outputs_in_use()`, `None` by default, each return a source, an `OutputsInUse`
+with `outputs()` (a list of `OutputInUse`: the output's place among the output ports, the main one
+0, and a name for what plays there), `depends_on()` (the parameter IDs they follow, the names'
+included) and `to_main(output)` (the parameter values, by ID and plain value, that send what plays
+on an output back to main, for a host whose track for it is deleted to set in the same undo step;
+the owner, 2026-11-20; empty by default). A plugin in both formats returns the same source from
+each. The plugin never changes itself when asked: it names values, and the host sets them.
+
+**How it works:** `UsedOutputs`, shared by both wrappers, keeps the flag and the outputs last told,
+exactly as *Note names* does, and numbers each output as its wrapper does:
+- **CLAP** (`src/wrapper/clap/outputs_in_use.rs`): the port id the wrapper gives it, the inputs
+  of the first layout that has the output counted first (`port_id`; `to_main` takes a port back
+  to its output, `output_of_port`), a value given as `params` gives one: normalized, or a stepped
+  parameter's step, rounded exact. Its own task
+  (`Task::OutputsInUseChanged`), raised by a parameter in `depends_on()`, `Task::StateChanged` and
+  the dirty-only GUI transaction; a full task queue loses no change, as `on_main_thread()` checks
+  the flag. The extension is offered, and the host's side queried in `init`, only when there is a
+  source. A name is NUL-terminated UTF-8 in `CLAP_NAME_SIZE` bytes, cut at a character boundary
+  (`copy_name`), never mid-character as `strlcpy` would.
+- **VST3** (`src/wrapper/vst3/outputs_in_use.rs`): the output bus index, which is the output's
+  place; `getToMain` gives each value normalized. The `vst3` crate generates only Steinberg's interfaces, so the two are written by hand as
+  it writes its own, their IDs `DECLARE_CLASS_IID`'s through `vst3::uid`. `IOutputsInUse` is in
+  every wrapper's interface list, as a COM list is static: one with no source answers
+  `getOutputCount` with `kNotImplemented`. A name is NUL-terminated UTF-16 in a `String128`, never
+  cut between the halves of a surrogate pair. The flag is raised at the same points
+  (`set_normalized_value_by_hash`, the end of `set_state_inner`, the dirty-only GUI state), but
+  **the check runs on the main thread only**: on Linux a task posted from the audio thread runs
+  on a background thread, which leaves the flag raised. So a raise on the main thread checks at
+  once even when the flag is already up, every task run there checks after it, and so does
+  `setParamNormalized`, the host's UI-thread follow-up of each value its processor heard. The
+  host is told through its handler's `IOutputsInUseHandler`, when it has one.
+
+**Regression tests:**
+- `wrapper::outputs_in_use::tests`: the flag, the comparison, what `get()` serves, and an output
+  numbered as the format numbers it, or left out;
+- `wrapper::clap::outputs_in_use::tests`: a port id after the inputs of the first layout that has
+  the output, and a name cut at a character boundary;
+- `wrapper::vst3::outputs_in_use::tests`: a UTF-16 name cut outside a surrogate pair, and the
+  interface ID's bytes on each platform;
+- `wrapper::clap::wrapper::mxm_outputs_in_use_tests` and
+  `wrapper::vst3::wrapper::mxm_outputs_in_use_tests`, a whole wrapper and a host that counts what
+  it is told, its test plugin behind a main input, so CLAP's ports and VST3's buses differ:
+  - only a plugin with a source offers the CLAP extension; VST3's answers `kNotImplemented`;
+  - a part routed to an output tells the host once and names it, two parts sharing one output
+    naming both, and a parameter the outputs don't depend on tells nothing;
+  - what sends an output's parts back to main, each value in the format's units (a stepped
+    parameter's step for CLAP, normalized for VST3), nothing for an output with none;
+  - a state load that routes a part tells the host.
+
+**Checks run** (2026-11-20, Linux, this crate only): `python ws.py check --only nice-plug` (fmt,
+`cargo clippy --all-targets -- -D warnings`, `cargo test`): clean.
 
 ## The VST3 wrapper in DaVinci Resolve — fixes (2026-10-29)
 

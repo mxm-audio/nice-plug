@@ -6,11 +6,15 @@ mod descriptor;
 pub mod features;
 // MXM PATCH (note names): the capability's state, see `ClapPlugin::note_names`.
 mod note_names;
+// MXM PATCH (outputs in use): the CLAP extension, see `ClapPlugin::outputs_in_use`.
+pub mod outputs_in_use;
 // MXM PATCH (presets): preset discovery and `preset-load`, see `ClapPlugin::CLAP_PRESETS`.
 pub mod presets;
 mod wrapper;
 
 use crate::wrapper::clap::features::ClapFeature;
+// MXM PATCH (outputs in use): the source, shared with the VST3 wrapper.
+use crate::wrapper::outputs_in_use::OutputsInUse;
 // MXM PATCH (presets)
 #[cfg(feature = "editor")]
 pub use self::presets::ClapPresetLoader;
@@ -70,6 +74,23 @@ pub trait ClapPlugin: Plugin {
     /// parameter the source [depends on][ClapNoteNames::depends_on()] changes, after any state
     /// load, and after any GUI state transaction, the dirty-only form included.
     fn note_names(&self) -> Option<Arc<dyn ClapNoteNames>> {
+        None
+    }
+
+    // MXM PATCH (outputs in use): a capability, not a fix. See `PATCHES.md`, *Outputs in use*.
+    /// The output ports after the main one that something in this plugin sends to now, with a
+    /// name for what plays on each, through the MXM extension `dk.mxm.outputs-in-use/1`: a drum
+    /// machine's slots routed to their own outputs, say, so a host can give each its own track.
+    /// `None`, the default, offers no extension. `Vst3Plugin::outputs_in_use()` is the same for
+    /// VST3; a plugin in both formats returns the same source from each.
+    ///
+    /// Called once, while the wrapper is built, as [`note_names()`][Self::note_names()] is, so
+    /// the source reads shared state (the parameters, a persistent field), never the plugin
+    /// itself. The wrapper reads the outputs again, and tells the host when they differ, at the
+    /// same points as the note names: after a parameter the source
+    /// [depends on][OutputsInUse::depends_on()] changes, after any state load, and after any
+    /// GUI state transaction.
+    fn outputs_in_use(&self) -> Option<Arc<dyn OutputsInUse>> {
         None
     }
 

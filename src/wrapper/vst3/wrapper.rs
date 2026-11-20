@@ -35,13 +35,16 @@ use vst3::Steinberg::Vst::{
 };
 use vst3::Steinberg::{
     FIDString, FUnknown, IBStream, IBStreamTrait, IPlugView, IPluginBaseTrait, TBool, TUID, int16,
-    int32, kInvalidArgument, kNoInterface, kResultFalse, kResultOk, tresult, uint32,
+    int32, kInvalidArgument, kNoInterface, kNotImplemented, kResultFalse, kResultOk, tresult,
+    uint32,
 };
 use vst3::{Class, ComRef};
 use widestring::U16CStr;
 
 use super::inner::{InProcess, ProcessEvent, WrapperInner};
 use super::note_expressions;
+// MXM PATCH (outputs in use)
+use super::outputs_in_use::{IOutputsInUse, IOutputsInUseTrait, copy_name};
 use super::util::{VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START, u16strlcpy};
 use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
 use crate::util::permit_alloc;
@@ -79,6 +82,9 @@ impl<P: Vst3Plugin> Class for Wrapper<P> {
         IProcessContextRequirements,
         IUnitInfo,
         IInfoListener,
+        // MXM PATCH (outputs in use): offered by every plugin; one that doesn't say which outputs
+        // it sends to answers `kNotImplemented`.
+        IOutputsInUse,
     );
 }
 
@@ -777,7 +783,11 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
     unsafe fn setParamNormalized(&self, id: ParamID, value: ParamValue) -> tresult {
         // MXM PATCH (suspended processing): upstream ignored this while the plugin was processing,
         // for a block to bring the change; a host that runs no block left it unapplied.
-        self.inner.set_or_defer(id, value as f32)
+        let result = self.inner.set_or_defer(id, value as f32);
+        // MXM PATCH (outputs in use): the host's UI-thread follow-up of each value its processor
+        // heard, so a change the audio thread raised is checked here.
+        self.inner.check_outputs_in_use();
+        result
     }
 
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
@@ -1883,6 +1893,69 @@ impl<P: Vst3Plugin> IUnitInfoTrait for Wrapper<P> {
     }
 }
 
+// MXM PATCH (outputs in use): a capability, not a fix. See `PATCHES.md`, *Outputs in use*.
+impl<P: Vst3Plugin> IOutputsInUseTrait for Wrapper<P> {
+    unsafe fn getOutputCount(&self, count: *mut int32) -> tresult {
+        check_null_ptr!(count);
+
+        let Some(in_use) = &self.inner.outputs_in_use else {
+            unsafe { *count = 0 };
+            return kNotImplemented;
+        };
+        unsafe { *count = int32::try_from(in_use.count()).unwrap_or(int32::MAX) };
+        kResultOk
+    }
+
+    unsafe fn getOutputInUse(
+        &self,
+        index: int32,
+        bus_index: *mut int32,
+        name: *mut String128,
+    ) -> tresult {
+        check_null_ptr!(bus_index, name);
+
+        let Some(output) = u32::try_from(index)
+            .ok()
+            .and_then(|index| self.inner.outputs_in_use.as_ref()?.get(index))
+        else {
+            return kInvalidArgument;
+        };
+        unsafe { *bus_index = output.output as int32 };
+        copy_name(unsafe { &mut *name }, &output.name);
+        kResultOk
+    }
+
+    unsafe fn getToMain(
+        &self,
+        bus_index: int32,
+        index: int32,
+        id: *mut ParamID,
+        value: *mut ParamValue,
+    ) -> tresult {
+        check_null_ptr!(id, value);
+
+        let Some(in_use) = &self.inner.outputs_in_use else {
+            return kNotImplemented;
+        };
+        // An output's bus index is its place among the outputs.
+        let (Ok(output), Ok(index)) = (u32::try_from(bus_index), usize::try_from(index)) else {
+            return kInvalidArgument;
+        };
+        let values = in_use.to_main(output);
+        let Some((hash, param, plain)) = values.get(index).and_then(|&(param, plain)| {
+            let hash = *self.inner.param_id_to_hash.get(param)?;
+            Some((hash, *self.inner.param_by_hash.get(&hash)?, plain))
+        }) else {
+            return kResultFalse;
+        };
+        unsafe {
+            *id = hash;
+            *value = param.preview_normalized(plain) as ParamValue;
+        }
+        kResultOk
+    }
+}
+
 impl<P: Vst3Plugin> IInfoListenerTrait for Wrapper<P> {
     unsafe fn setChannelContextInfos(&self, list: *mut IAttributeList) -> tresult {
         #[cfg(not(feature = "editor"))]
@@ -1946,5 +2019,329 @@ impl<P: Vst3Plugin> IInfoListenerTrait for Wrapper<P> {
 
             kResultOk
         }
+    }
+}
+
+// MXM PATCH (outputs in use): `IOutputsInUse` through a whole wrapper, with a host handler that
+// counts what it is told. `wrapper/outputs_in_use.rs` holds the unit tests of the flag and the
+// comparison, `vst3/outputs_in_use.rs` those of the name and the IDs.
+#[cfg(test)]
+mod mxm_outputs_in_use_tests {
+    use super::Wrapper;
+    use crate::prelude::*;
+    use crate::wrapper::vst3::Vst3Plugin;
+    use crate::wrapper::vst3::outputs_in_use::{
+        IOutputsInUse, IOutputsInUseHandler, IOutputsInUseHandlerTrait,
+    };
+    use crate::wrapper::vst3::subcategories::Vst3SubCategory;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use vst3::Steinberg::Vst::{
+        IComponentHandler, IComponentHandlerTrait, IEditControllerTrait, ParamID, ParamValue,
+        String128,
+    };
+    use vst3::Steinberg::{int32, kNotImplemented, kResultOk, tresult};
+    use vst3::{Class, ComPtr, ComWrapper};
+
+    /// The host's handler, counting `outputsInUseChanged`.
+    #[derive(Default)]
+    struct Host {
+        changed: AtomicUsize,
+    }
+
+    impl Class for Host {
+        type Interfaces = (IComponentHandler, IOutputsInUseHandler);
+    }
+
+    impl IComponentHandlerTrait for Host {
+        unsafe fn beginEdit(&self, _id: ParamID) -> tresult {
+            kResultOk
+        }
+
+        unsafe fn performEdit(&self, _id: ParamID, _value: ParamValue) -> tresult {
+            kResultOk
+        }
+
+        unsafe fn endEdit(&self, _id: ParamID) -> tresult {
+            kResultOk
+        }
+
+        unsafe fn restartComponent(&self, _flags: int32) -> tresult {
+            kResultOk
+        }
+    }
+
+    impl IOutputsInUseHandlerTrait for Host {
+        unsafe fn outputsInUseChanged(&self) -> tresult {
+            self.changed.fetch_add(1, Ordering::AcqRel);
+            kResultOk
+        }
+    }
+
+    /// Two parts, each sent to main (0) or an output (1 or 2), and a level nothing depends on.
+    struct TestParams {
+        first: IntParam,
+        second: IntParam,
+        level: IntParam,
+    }
+
+    impl Default for TestParams {
+        fn default() -> Self {
+            let output = |name| IntParam::new(name, 0, IntRange::Linear { min: 0, max: 2 });
+            Self {
+                first: output("First"),
+                second: output("Second"),
+                level: IntParam::new("Level", 0, IntRange::Linear { min: 0, max: 9 }),
+            }
+        }
+    }
+
+    unsafe impl Params for TestParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            vec![
+                ("first".to_owned(), self.first.as_ptr(), String::new()),
+                ("second".to_owned(), self.second.as_ptr(), String::new()),
+                ("level".to_owned(), self.level.as_ptr(), String::new()),
+            ]
+        }
+    }
+
+    struct Routed(Arc<TestParams>);
+
+    impl OutputsInUse for Routed {
+        fn outputs(&self) -> Vec<OutputInUse> {
+            let parts = [
+                ("Kick", self.0.first.value()),
+                ("Snare", self.0.second.value()),
+            ];
+            (1..=2)
+                .filter_map(|output| {
+                    let names: Vec<&str> = parts
+                        .iter()
+                        .filter(|(_, to)| *to == output)
+                        .map(|(name, _)| *name)
+                        .collect();
+                    (!names.is_empty()).then(|| OutputInUse {
+                        output: output as u32,
+                        name: names.join(" / "),
+                    })
+                })
+                .collect()
+        }
+
+        fn depends_on(&self) -> Vec<&'static str> {
+            vec!["first", "second"]
+        }
+
+        /// Each part on `output` back to main, and the level to 4, so a value's units show.
+        fn to_main(&self, output: u32) -> Vec<(&'static str, f32)> {
+            let mut values: Vec<(&'static str, f32)> = [
+                ("first", self.0.first.value()),
+                ("second", self.0.second.value()),
+            ]
+            .into_iter()
+            .filter(|&(_, to)| to as u32 == output)
+            .map(|(id, _)| (id, 0.0))
+            .collect();
+            if !values.is_empty() {
+                values.push(("level", 4.0));
+            }
+            values
+        }
+    }
+
+    macro_rules! test_plugin {
+        ($name:ident, $id:expr, $in_use:expr) => {
+            #[derive(Default)]
+            struct $name {
+                params: Arc<TestParams>,
+            }
+
+            impl Plugin for $name {
+                const NAME: &'static str = "Outputs in use";
+                const VENDOR: &'static str = "MXM";
+                const URL: &'static str = "";
+                const EMAIL: &'static str = "";
+                const VERSION: &'static str = "1";
+                // A main input before the outputs, which CLAP's port ids count and VST3's output
+                // bus indices don't.
+                const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+                    main_input_channels: Some(new_nonzero_u32(2)),
+                    main_output_channels: Some(new_nonzero_u32(2)),
+                    aux_output_ports: &[new_nonzero_u32(2), new_nonzero_u32(2)],
+                    ..AudioIOLayout::const_default()
+                }];
+                type Editor = ();
+                type SysExMessage = ();
+                type BackgroundTask = ();
+
+                fn params(&self) -> Arc<dyn Params> {
+                    self.params.clone()
+                }
+
+                fn process(
+                    &mut self,
+                    _buffer: &mut Buffer,
+                    _aux: &mut AuxiliaryBuffers,
+                    _context: &mut impl ProcessContext<Self>,
+                ) -> ProcessStatus {
+                    ProcessStatus::Normal
+                }
+            }
+
+            impl Vst3Plugin for $name {
+                const VST3_CLASS_ID: [u8; 16] = $id;
+                const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[];
+
+                fn outputs_in_use(&self) -> Option<Arc<dyn OutputsInUse>> {
+                    let in_use: fn(&Arc<TestParams>) -> Option<Arc<dyn OutputsInUse>> = $in_use;
+                    in_use(&self.params)
+                }
+            }
+        };
+    }
+
+    test_plugin!(Routing, *b"MxmTestRouting01", |params| Some(Arc::new(
+        Routed(params.clone())
+    )));
+    test_plugin!(Unrouted, *b"MxmTestUnrouted1", |_| None);
+
+    /// The wrapper, made on this thread, which is then its main thread, and the host's handler,
+    /// set as a host sets it.
+    fn wrapper<P: Vst3Plugin>() -> (ComWrapper<Wrapper<P>>, ComWrapper<Host>) {
+        let wrapper = ComWrapper::new(Wrapper::<P>::new());
+        let host = ComWrapper::new(Host::default());
+        let handler = host.to_com_ptr::<IComponentHandler>().unwrap();
+        assert_eq!(
+            unsafe { wrapper.setComponentHandler(handler.as_ptr()) },
+            kResultOk
+        );
+        (wrapper, host)
+    }
+
+    fn interface<P: Vst3Plugin>(wrapper: &ComWrapper<Wrapper<P>>) -> ComPtr<IOutputsInUse> {
+        wrapper.to_com_ptr::<IOutputsInUse>().expect("offered")
+    }
+
+    /// The outputs in use as a host reads them, through the interface.
+    fn outputs<P: Vst3Plugin>(wrapper: &ComWrapper<Wrapper<P>>) -> Vec<(i32, String)> {
+        let interface = interface(wrapper);
+        let ptr = interface.as_ptr();
+        let mut count = -1;
+        assert_eq!(
+            unsafe { ((*(*ptr).vtbl).getOutputCount)(ptr, &mut count) },
+            kResultOk
+        );
+        (0..count)
+            .map(|index| {
+                let mut bus = -1;
+                let mut name: String128 = [0; 128];
+                assert_eq!(
+                    unsafe { ((*(*ptr).vtbl).getOutputInUse)(ptr, index, &mut bus, &mut name) },
+                    kResultOk
+                );
+                let end = name.iter().position(|&unit| unit == 0).unwrap();
+                (bus, String::from_utf16(&name[..end]).unwrap())
+            })
+            .collect()
+    }
+
+    /// Sets an output parameter, 0 to 2, as a host's controller does.
+    fn set<P: Vst3Plugin>(wrapper: &ComWrapper<Wrapper<P>>, id: &str, value: f64) {
+        let hash = wrapper.inner.param_id_to_hash[id];
+        let max = if id == "level" { 9.0 } else { 2.0 };
+        assert_eq!(
+            unsafe { wrapper.setParamNormalized(hash, value / max) },
+            kResultOk
+        );
+    }
+
+    fn changed(host: &Host) -> usize {
+        host.changed.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn a_plugin_that_doesnt_say_which_outputs_it_sends_to_answers_not_implemented() {
+        let (unrouted, _) = wrapper::<Unrouted>();
+        let interface = interface(&unrouted);
+        let ptr = interface.as_ptr();
+        let mut count = -1;
+        assert_eq!(
+            unsafe { ((*(*ptr).vtbl).getOutputCount)(ptr, &mut count) },
+            kNotImplemented
+        );
+        assert_eq!(count, 0);
+        let (routing, _) = wrapper::<Routing>();
+        assert_eq!(outputs(&routing), [], "every part on main");
+    }
+
+    #[test]
+    fn a_part_routed_to_an_output_tells_the_host_and_names_it_on_its_bus() {
+        let (wrapper, host) = wrapper::<Routing>();
+        set(&wrapper, "level", 4.0);
+        assert_eq!(changed(&host), 0, "the outputs don't depend on it");
+        set(&wrapper, "second", 2.0);
+        assert_eq!(changed(&host), 1);
+        assert_eq!(
+            outputs(&wrapper),
+            [(2, "Snare".to_owned())],
+            "bus 2, whatever comes before the outputs"
+        );
+        set(&wrapper, "first", 2.0);
+        assert_eq!(changed(&host), 2, "renamed: two parts share it");
+        assert_eq!(outputs(&wrapper), [(2, "Kick / Snare".to_owned())]);
+        set(&wrapper, "first", 2.0);
+        assert_eq!(changed(&host), 2, "unchanged, nothing to tell");
+        set(&wrapper, "first", 0.0);
+        set(&wrapper, "second", 0.0);
+        assert_eq!(changed(&host), 4);
+        assert_eq!(outputs(&wrapper), []);
+    }
+
+    /// What a host sets, by its bus, to send a bus's parts back to main.
+    fn to_main<P: Vst3Plugin>(wrapper: &ComWrapper<Wrapper<P>>, bus: i32) -> Vec<(u32, f64)> {
+        let interface = interface(wrapper);
+        let ptr = interface.as_ptr();
+        let mut values = Vec::new();
+        loop {
+            let (mut id, mut value) = (u32::MAX, f64::NAN);
+            let index = values.len() as i32;
+            let got = unsafe { ((*(*ptr).vtbl).getToMain)(ptr, bus, index, &mut id, &mut value) };
+            if got != kResultOk {
+                return values;
+            }
+            values.push((id, value));
+        }
+    }
+
+    #[test]
+    fn a_bus_says_what_sends_its_parts_back_to_main_normalized() {
+        let (wrapper, _) = wrapper::<Routing>();
+        set(&wrapper, "first", 2.0);
+        set(&wrapper, "second", 2.0);
+        let id = |id: &str| wrapper.inner.param_id_to_hash[id];
+        assert_eq!(
+            to_main(&wrapper, 2),
+            [
+                (id("first"), 0.0),
+                (id("second"), 0.0),
+                (id("level"), f64::from(4.0f32 / 9.0))
+            ],
+            "bus 2, whatever comes before the outputs"
+        );
+        assert_eq!(to_main(&wrapper, 1), [], "nothing on output 1");
+    }
+
+    #[cfg(feature = "editor")]
+    #[test]
+    fn a_state_load_that_routes_a_part_tells_the_host() {
+        use nice_plug_core::plugin::ParamValue as Value;
+
+        let (wrapper, host) = wrapper::<Routing>();
+        let mut state = wrapper.inner.get_state_object();
+        state.params.insert("first".to_owned(), Value::I32(1));
+        assert!(wrapper.inner.set_state_inner(&mut state));
+        assert_eq!(changed(&host), 1);
+        assert_eq!(outputs(&wrapper), [(1, "Kick".to_owned())]);
     }
 }

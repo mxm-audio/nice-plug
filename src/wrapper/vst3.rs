@@ -5,6 +5,8 @@ mod context;
 mod factory;
 mod inner;
 mod note_expressions;
+// MXM PATCH (outputs in use): the VST3 interfaces, see `Vst3Plugin::outputs_in_use`.
+pub mod outputs_in_use;
 mod param_units;
 pub mod subcategories;
 mod wrapper;
@@ -18,7 +20,9 @@ use nice_plug_core::plugin::Plugin;
 pub use vst3;
 pub use wrapper::Wrapper;
 
+use crate::wrapper::outputs_in_use::OutputsInUse;
 use crate::wrapper::vst3::subcategories::Vst3SubCategory;
+use std::sync::Arc;
 
 /// Provides auxiliary metadata needed for a VST3 plugin.
 pub trait Vst3Plugin: Plugin {
@@ -32,6 +36,20 @@ pub trait Vst3Plugin: Plugin {
     /// (`|`). This string has a limit of 127 characters, and anything longer than that will be
     /// truncated.
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory];
+
+    // MXM PATCH (outputs in use): a capability, not a fix. See `PATCHES.md`, *Outputs in use*.
+    /// The output buses after the main one that something in this plugin sends to now, with a
+    /// name for what plays on each, through the MXM interface `IOutputsInUse` on the component:
+    /// the VST3 twin of `ClapPlugin::outputs_in_use()`, which a plugin in both formats answers
+    /// with the same source. `None`, the default, has `getOutputCount` answer `kNotImplemented`.
+    ///
+    /// Called once, while the wrapper is built, so the source reads shared state, never the plugin
+    /// itself. The wrapper reads the outputs again, and tells the host's `IOutputsInUseHandler`
+    /// when they differ, after a parameter the source depends on changes, after any state load and
+    /// after any GUI state transaction.
+    fn outputs_in_use(&self) -> Option<Arc<dyn OutputsInUse>> {
+        None
+    }
 
     /// [`VST3_CLASS_ID`][Self::VST3_CLASS_ID`] in the correct order for the current platform so
     /// projects and presets can be shared between platforms. This should not be overridden.

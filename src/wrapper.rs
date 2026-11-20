@@ -2,6 +2,8 @@
 //! name of a type that implements `Plugin` to. The macro will handle the rest.
 
 pub mod clap;
+// MXM PATCH (outputs in use): what a plugin says it sends to, for the CLAP and VST3 wrappers.
+pub mod outputs_in_use;
 pub(crate) mod state;
 pub(crate) mod util;
 

@@ -119,6 +119,12 @@ use crate::wrapper::clap::context::RemoteControlPages;
 use crate::wrapper::clap::context::WrapperGuiContext;
 // MXM PATCH (note names)
 use crate::wrapper::clap::note_names::NoteNames;
+// MXM PATCH (outputs in use)
+use crate::wrapper::clap::outputs_in_use::{
+    DK_MXM_EXT_OUTPUTS_IN_USE, copy_name, dk_mxm_host_outputs_in_use, dk_mxm_plugin_outputs_in_use,
+    output_of_port, port_id,
+};
+use crate::wrapper::outputs_in_use::UsedOutputs;
 // MXM PATCH (presets)
 #[cfg(feature = "editor")]
 use crate::wrapper::clap::presets::ClapPresetLoader;
@@ -309,6 +315,13 @@ pub struct Wrapper<P: ClapPlugin> {
     host_note_name: AtomicRefCell<Option<ClapPtr<clap_host_note_name>>>,
     note_names: Option<NoteNames>,
 
+    // MXM PATCH (outputs in use): the MXM extension, offered only when the plugin says which
+    // outputs it sends to; the host's side, queried in `init`; and what they are and whether the
+    // host must be told.
+    clap_plugin_outputs_in_use: dk_mxm_plugin_outputs_in_use,
+    host_outputs_in_use: AtomicRefCell<Option<ClapPtr<dk_mxm_host_outputs_in_use>>>,
+    outputs_in_use: Option<UsedOutputs>,
+
     // MXM PATCH (presets): `preset-load`, offered only when the plugin loads preset files; the
     // host's side, queried in `init`; and the plugin's loader.
     #[cfg(feature = "editor")]
@@ -424,6 +437,9 @@ pub enum Task<P: Plugin> {
     VoiceInfoChanged,
     /// MXM PATCH (note names): read the note names again, and tell the host if they changed.
     NoteNamesChanged,
+    /// MXM PATCH (outputs in use): read the outputs in use again, and tell the host if they
+    /// changed.
+    OutputsInUseChanged,
     /// Tell the host that it should rescan the current parameter values.
     // MXM PATCH (defects 3 and 8, refreshed onto 0.4.2): upstream's only sender was the
     // audio-thread GUI-state handoff that defect 8 removes, and defect 3's rescan now rides on
@@ -549,6 +565,8 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                 // MXM PATCH (note names): a host state load and a full GUI transaction both come
                 // here; either may rename a note.
                 self.note_names_touched();
+                // MXM PATCH (outputs in use): or route a part elsewhere.
+                self.outputs_in_use_touched();
             }
             #[cfg(feature = "editor")]
             Task::ParameterModulationChanged(param_hash, modulation_offset) => {
@@ -597,6 +615,8 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
             },
             // MXM PATCH (note names)
             Task::NoteNamesChanged => self.check_note_names(),
+            // MXM PATCH (outputs in use)
+            Task::OutputsInUseChanged => self.check_outputs_in_use(),
             Task::RescanParamValues => match &*self.host_params.borrow() {
                 Some(host_params) => {
                     crate::nice_debug_assert!(is_gui_thread);
@@ -868,6 +888,13 @@ impl<P: ClapPlugin> Wrapper<P> {
         let note_names = plugin
             .note_names()
             .map(|source| NoteNames::new(source, &param_id_to_hash));
+        // MXM PATCH (outputs in use): asked once, as the note names are; each output numbered as
+        // the port this wrapper gives it.
+        let outputs_in_use = plugin.outputs_in_use().map(|source| {
+            UsedOutputs::new(source, &param_id_to_hash, |output| {
+                port_id(P::AUDIO_IO_LAYOUTS, output)
+            })
+        });
         // MXM PATCH (presets): asked once, as the note names are, so a load never takes the
         // plugin's lock.
         #[cfg(feature = "editor")]
@@ -1008,6 +1035,15 @@ impl<P: ClapPlugin> Wrapper<P> {
             },
             host_note_name: AtomicRefCell::new(None),
             note_names,
+
+            // MXM PATCH (outputs in use)
+            clap_plugin_outputs_in_use: dk_mxm_plugin_outputs_in_use {
+                count: Some(Self::ext_outputs_in_use_count),
+                get: Some(Self::ext_outputs_in_use_get),
+                to_main: Some(Self::ext_outputs_in_use_to_main),
+            },
+            host_outputs_in_use: AtomicRefCell::new(None),
+            outputs_in_use,
 
             // MXM PATCH (presets)
             #[cfg(feature = "editor")]
@@ -1237,6 +1273,14 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .is_some_and(|names| names.depends_on(hash))
                             {
                                 self.note_names_touched();
+                            }
+                            // MXM PATCH (outputs in use): the same, for the outputs in use.
+                            if self
+                                .outputs_in_use
+                                .as_ref()
+                                .is_some_and(|in_use| in_use.depends_on(hash))
+                            {
+                                self.outputs_in_use_touched();
                             }
 
                             #[cfg(feature = "editor")]
@@ -1912,6 +1956,8 @@ impl<P: ClapPlugin> Wrapper<P> {
         // `StateChanged` that reads the names again; a persistent field it published may name a
         // note.
         self.note_names_touched();
+        // MXM PATCH (outputs in use): or name what plays on an output.
+        self.outputs_in_use_touched();
     }
 
     /// MXM PATCH (note names): something that may rename a note changed, on any thread. Raises the
@@ -1938,6 +1984,31 @@ impl<P: ClapPlugin> Wrapper<P> {
             && let Some(host_note_name) = &*self.host_note_name.borrow()
         {
             unsafe_clap_call! { host_note_name=>changed(&*self.host_callback) };
+        }
+    }
+
+    /// MXM PATCH (outputs in use): something that may route a part elsewhere, or rename what plays
+    /// on an output, changed, on any thread. As `note_names_touched()`.
+    fn outputs_in_use_touched(&self) {
+        let Some(in_use) = &self.outputs_in_use else {
+            return;
+        };
+        if in_use.raise() && !self.schedule_gui(Task::OutputsInUseChanged) {
+            let host = &self.host_callback;
+            unsafe_clap_call! { host=>request_callback(&**host) };
+        }
+    }
+
+    /// MXM PATCH (outputs in use): on the main thread, tells the host if a raised change changed
+    /// the outputs in use or their names.
+    fn check_outputs_in_use(&self) {
+        let Some(in_use) = &self.outputs_in_use else {
+            return;
+        };
+        if in_use.check()
+            && let Some(host_outputs_in_use) = &*self.host_outputs_in_use.borrow()
+        {
+            unsafe_clap_call! { host_outputs_in_use=>changed(&*self.host_callback) };
         }
     }
 
@@ -2219,6 +2290,14 @@ impl<P: ClapPlugin> Wrapper<P> {
                     &wrapper.host_callback,
                     CLAP_EXT_NOTE_NAME,
                 );
+            }
+            // MXM PATCH (outputs in use)
+            if wrapper.outputs_in_use.is_some() {
+                *wrapper.host_outputs_in_use.borrow_mut() =
+                    query_host_extension::<dk_mxm_host_outputs_in_use>(
+                        &wrapper.host_callback,
+                        DK_MXM_EXT_OUTPUTS_IN_USE,
+                    );
             }
             // MXM PATCH (presets)
             #[cfg(feature = "editor")]
@@ -2922,6 +3001,13 @@ impl<P: ClapPlugin> Wrapper<P> {
             } else {
                 std::ptr::null()
             }
+        } else if id == DK_MXM_EXT_OUTPUTS_IN_USE {
+            // MXM PATCH (outputs in use): only for a plugin that says which outputs it sends to.
+            if wrapper.outputs_in_use.is_some() {
+                &wrapper.clap_plugin_outputs_in_use as *const _ as *const c_void
+            } else {
+                std::ptr::null()
+            }
         } else if id == CLAP_EXT_REMOTE_CONTROLS {
             &wrapper.clap_plugin_remote_controls as *const _ as *const c_void
         } else if id == CLAP_EXT_RENDER {
@@ -2970,6 +3056,8 @@ impl<P: ClapPlugin> Wrapper<P> {
 
         // MXM PATCH (note names): a change whose task found the queue full left its flag raised.
         wrapper.check_note_names();
+        // MXM PATCH (outputs in use): the same.
+        wrapper.check_outputs_in_use();
     }
 
     unsafe extern "C" fn ext_audio_ports_config_count(plugin: *const clap_plugin) -> u32 {
@@ -4102,6 +4190,89 @@ impl<P: ClapPlugin> Wrapper<P> {
         true
     }
 
+    // MXM PATCH (outputs in use)
+    unsafe extern "C" fn ext_outputs_in_use_count(plugin: *const clap_plugin) -> u32 {
+        check_null_ptr!(0, plugin, unsafe { (*plugin).plugin_data });
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+
+        wrapper
+            .outputs_in_use
+            .as_ref()
+            .map_or(0, UsedOutputs::count)
+    }
+
+    // MXM PATCH (outputs in use)
+    unsafe extern "C" fn ext_outputs_in_use_get(
+        plugin: *const clap_plugin,
+        index: u32,
+        port_id: *mut clap_id,
+        name: *mut c_char,
+    ) -> bool {
+        check_null_ptr!(
+            false,
+            plugin,
+            unsafe { (*plugin).plugin_data },
+            port_id,
+            name
+        );
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+
+        let Some(output) = wrapper
+            .outputs_in_use
+            .as_ref()
+            .and_then(|in_use| in_use.get(index))
+        else {
+            return false;
+        };
+        unsafe { *port_id = output.output };
+        let name =
+            unsafe { std::slice::from_raw_parts_mut(name, clap_sys::string_sizes::CLAP_NAME_SIZE) };
+        copy_name(name, &output.name);
+        true
+    }
+
+    // MXM PATCH (outputs in use)
+    unsafe extern "C" fn ext_outputs_in_use_to_main(
+        plugin: *const clap_plugin,
+        port_id: clap_id,
+        index: u32,
+        param_id: *mut clap_id,
+        value: *mut f64,
+    ) -> bool {
+        check_null_ptr!(
+            false,
+            plugin,
+            unsafe { (*plugin).plugin_data },
+            param_id,
+            value
+        );
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+
+        let (Some(in_use), Some(output)) = (
+            wrapper.outputs_in_use.as_ref(),
+            output_of_port(P::AUDIO_IO_LAYOUTS, port_id),
+        ) else {
+            return false;
+        };
+        let values = in_use.to_main(output);
+        let Some((hash, param, plain)) = values.get(index as usize).and_then(|&(id, plain)| {
+            let hash = *wrapper.param_id_to_hash.get(id)?;
+            Some((hash, *wrapper.param_by_hash.get(&hash)?, plain))
+        }) else {
+            return false;
+        };
+        // As `ext_params_get_value` gives a value: normalized, or a stepped one's step, exact.
+        let normalized = unsafe { param.preview_normalized(plain) } as f64;
+        unsafe {
+            *param_id = hash;
+            *value = match param.step_count() {
+                Some(steps) => (normalized * steps as f64).round(),
+                None => normalized,
+            };
+        }
+        true
+    }
+
     unsafe extern "C" fn ext_remote_controls_count(plugin: *const clap_plugin) -> u32 {
         check_null_ptr!(0, plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
@@ -4999,6 +5170,332 @@ mod mxm_note_name_tests {
         // further one.
         unsafe { Wrapper::<Naming>::on_main_thread(plugin(&wrapper)) };
         assert_eq!(changed(&probe), 1);
+    }
+}
+
+// MXM PATCH (outputs in use): the extension through a whole wrapper, with a host that counts what
+// it is told. `wrapper/outputs_in_use.rs` holds the unit tests of the flag and the comparison,
+// `clap/outputs_in_use.rs` those of the port ids and the names.
+#[cfg(test)]
+mod mxm_outputs_in_use_tests {
+    use super::{ClapParamUpdate, Wrapper};
+    use crate::prelude::*;
+    use crate::wrapper::clap::outputs_in_use::{
+        DK_MXM_EXT_OUTPUTS_IN_USE, dk_mxm_host_outputs_in_use, dk_mxm_plugin_outputs_in_use,
+    };
+    use clap_sys::host::clap_host;
+    use clap_sys::plugin::clap_plugin;
+    use clap_sys::string_sizes::CLAP_NAME_SIZE;
+    use clap_sys::version::CLAP_VERSION;
+    use nice_plug_core::plugin::ParamValue;
+    use std::ffi::{CStr, c_char, c_void};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Probe {
+        changed: AtomicUsize,
+    }
+
+    unsafe extern "C" fn outputs_changed(host: *const clap_host) {
+        let probe = unsafe { &*((*host).host_data as *const Probe) };
+        probe.changed.fetch_add(1, Ordering::AcqRel);
+    }
+
+    unsafe extern "C" fn nothing(_host: *const clap_host) {}
+
+    static HOST_OUTPUTS_IN_USE: dk_mxm_host_outputs_in_use = dk_mxm_host_outputs_in_use {
+        changed: Some(outputs_changed),
+    };
+
+    unsafe extern "C" fn host_extension(
+        _host: *const clap_host,
+        id: *const c_char,
+    ) -> *const c_void {
+        if unsafe { CStr::from_ptr(id) } == DK_MXM_EXT_OUTPUTS_IN_USE {
+            (&raw const HOST_OUTPUTS_IN_USE).cast()
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    fn host(probe: &Probe) -> Box<clap_host> {
+        Box::new(clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: (probe as *const Probe).cast_mut().cast::<c_void>(),
+            name: c"outputs-in-use-test".as_ptr(),
+            vendor: c"mxm".as_ptr(),
+            url: c"".as_ptr(),
+            version: c"1".as_ptr(),
+            get_extension: Some(host_extension),
+            request_restart: Some(nothing),
+            request_process: Some(nothing),
+            request_callback: Some(nothing),
+        })
+    }
+
+    /// Two parts, each sent to main (0) or an output (1 or 2), and a level nothing depends on.
+    struct TestParams {
+        first: IntParam,
+        second: IntParam,
+        level: IntParam,
+    }
+
+    impl Default for TestParams {
+        fn default() -> Self {
+            let output = |name| IntParam::new(name, 0, IntRange::Linear { min: 0, max: 2 });
+            Self {
+                first: output("First"),
+                second: output("Second"),
+                level: IntParam::new("Level", 0, IntRange::Linear { min: 0, max: 9 }),
+            }
+        }
+    }
+
+    unsafe impl Params for TestParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            vec![
+                ("first".to_owned(), self.first.as_ptr(), String::new()),
+                ("second".to_owned(), self.second.as_ptr(), String::new()),
+                ("level".to_owned(), self.level.as_ptr(), String::new()),
+            ]
+        }
+    }
+
+    struct Routed(Arc<TestParams>);
+
+    impl OutputsInUse for Routed {
+        fn outputs(&self) -> Vec<OutputInUse> {
+            let parts = [
+                ("Kick", self.0.first.value()),
+                ("Snare", self.0.second.value()),
+            ];
+            (1..=2)
+                .filter_map(|port| {
+                    let names: Vec<&str> = parts
+                        .iter()
+                        .filter(|(_, to)| *to == port)
+                        .map(|(name, _)| *name)
+                        .collect();
+                    (!names.is_empty()).then(|| OutputInUse {
+                        output: port as u32,
+                        name: names.join(" / "),
+                    })
+                })
+                .collect()
+        }
+
+        fn depends_on(&self) -> Vec<&'static str> {
+            vec!["first", "second"]
+        }
+
+        /// Each part on `output` back to main, and the level to 4, so a value's units show.
+        fn to_main(&self, output: u32) -> Vec<(&'static str, f32)> {
+            let mut values: Vec<(&'static str, f32)> = [
+                ("first", self.0.first.value()),
+                ("second", self.0.second.value()),
+            ]
+            .into_iter()
+            .filter(|&(_, to)| to as u32 == output)
+            .map(|(id, _)| (id, 0.0))
+            .collect();
+            if !values.is_empty() {
+                values.push(("level", 4.0));
+            }
+            values
+        }
+    }
+
+    macro_rules! test_plugin {
+        ($name:ident, $id:literal, $in_use:expr) => {
+            #[derive(Default)]
+            struct $name {
+                params: Arc<TestParams>,
+            }
+
+            impl Plugin for $name {
+                const NAME: &'static str = "Outputs in use";
+                const VENDOR: &'static str = "MXM";
+                const URL: &'static str = "";
+                const EMAIL: &'static str = "";
+                const VERSION: &'static str = "1";
+                // Behind a main input, so output 1 is port 2 and output 2 port 3.
+                const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+                    main_input_channels: Some(new_nonzero_u32(2)),
+                    main_output_channels: Some(new_nonzero_u32(2)),
+                    aux_output_ports: &[new_nonzero_u32(2), new_nonzero_u32(2)],
+                    ..AudioIOLayout::const_default()
+                }];
+                type Editor = ();
+                type SysExMessage = ();
+                type BackgroundTask = ();
+
+                fn params(&self) -> Arc<dyn Params> {
+                    self.params.clone()
+                }
+
+                fn process(
+                    &mut self,
+                    _buffer: &mut Buffer,
+                    _aux: &mut AuxiliaryBuffers,
+                    _context: &mut impl ProcessContext<Self>,
+                ) -> ProcessStatus {
+                    ProcessStatus::Normal
+                }
+            }
+
+            impl ClapPlugin for $name {
+                const CLAP_ID: &'static str = $id;
+                const CLAP_DESCRIPTION: Option<&'static str> = None;
+                const CLAP_MANUAL_URL: Option<&'static str> = None;
+                const CLAP_SUPPORT_URL: Option<&'static str> = None;
+                const CLAP_FEATURES: &'static [ClapFeature] = &[];
+
+                fn outputs_in_use(&self) -> Option<Arc<dyn OutputsInUse>> {
+                    let in_use: fn(&Arc<TestParams>) -> Option<Arc<dyn OutputsInUse>> = $in_use;
+                    in_use(&self.params)
+                }
+            }
+        };
+    }
+
+    test_plugin!(Routing, "dk.mxm.test.routing", |params| Some(Arc::new(
+        Routed(params.clone())
+    )));
+    test_plugin!(Unrouted, "dk.mxm.test.unrouted", |_| None);
+
+    /// The wrapper, initialized on this thread, which is then its main thread.
+    fn wrapper<P: ClapPlugin>(host: &clap_host) -> Arc<Wrapper<P>> {
+        let wrapper = unsafe { Wrapper::<P>::new(host) };
+        assert!(unsafe { Wrapper::<P>::init(plugin(&wrapper)) });
+        wrapper
+    }
+
+    fn plugin<P: ClapPlugin>(wrapper: &Wrapper<P>) -> *const clap_plugin {
+        wrapper.clap_plugin.as_ptr()
+    }
+
+    /// The outputs in use as a host reads them, through the extension it's offered.
+    fn outputs<P: ClapPlugin>(wrapper: &Wrapper<P>) -> Vec<(u32, String)> {
+        let plugin = plugin(wrapper);
+        let extension =
+            unsafe { Wrapper::<P>::get_extension(plugin, DK_MXM_EXT_OUTPUTS_IN_USE.as_ptr()) };
+        assert!(!extension.is_null(), "offered");
+        let extension = unsafe { &*extension.cast::<dk_mxm_plugin_outputs_in_use>() };
+        let count = unsafe { extension.count.unwrap()(plugin) };
+        (0..count)
+            .map(|index| {
+                let mut port = u32::MAX;
+                let mut name = [0 as c_char; CLAP_NAME_SIZE];
+                assert!(unsafe {
+                    extension.get.unwrap()(plugin, index, &mut port, name.as_mut_ptr())
+                });
+                let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+                (port, name.to_str().unwrap().to_owned())
+            })
+            .collect()
+    }
+
+    fn set<P: ClapPlugin>(wrapper: &Wrapper<P>, id: &str, value: f64) {
+        let hash = wrapper.param_id_to_hash[id];
+        wrapper.update_plain_value_by_hash(hash, ClapParamUpdate::PlainValueSet(value), None);
+    }
+
+    fn changed(probe: &Probe) -> usize {
+        probe.changed.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn only_a_plugin_that_says_which_outputs_it_sends_to_offers_the_extension() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let unrouted = wrapper::<Unrouted>(&host);
+        let offered = unsafe {
+            Wrapper::<Unrouted>::get_extension(
+                plugin(&unrouted),
+                DK_MXM_EXT_OUTPUTS_IN_USE.as_ptr(),
+            )
+        };
+        assert!(offered.is_null());
+        let routing = wrapper::<Routing>(&host);
+        assert_eq!(outputs(&routing), [], "every part on main");
+    }
+
+    #[test]
+    fn a_part_routed_to_an_output_tells_the_host_and_names_it() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let wrapper = wrapper::<Routing>(&host);
+        set(&wrapper, "level", 4.0);
+        assert_eq!(changed(&probe), 0, "the outputs don't depend on it");
+        set(&wrapper, "second", 2.0);
+        assert_eq!(changed(&probe), 1);
+        assert_eq!(
+            outputs(&wrapper),
+            [(3, "Snare".to_owned())],
+            "after the input"
+        );
+        set(&wrapper, "first", 2.0);
+        assert_eq!(changed(&probe), 2, "renamed: two parts share it");
+        assert_eq!(outputs(&wrapper), [(3, "Kick / Snare".to_owned())]);
+        set(&wrapper, "first", 2.0);
+        assert_eq!(changed(&probe), 2, "unchanged, nothing to tell");
+        set(&wrapper, "first", 0.0);
+        set(&wrapper, "second", 0.0);
+        assert_eq!(changed(&probe), 4);
+        assert_eq!(outputs(&wrapper), []);
+    }
+
+    /// What a host sets, by its port, to send a port's parts back to main.
+    fn to_main<P: ClapPlugin>(wrapper: &Wrapper<P>, port: u32) -> Vec<(u32, f64)> {
+        let plugin = plugin(wrapper);
+        let extension =
+            unsafe { Wrapper::<P>::get_extension(plugin, DK_MXM_EXT_OUTPUTS_IN_USE.as_ptr()) };
+        let extension = unsafe { &*extension.cast::<dk_mxm_plugin_outputs_in_use>() };
+        let mut values = Vec::new();
+        loop {
+            let (mut id, mut value) = (u32::MAX, f64::NAN);
+            let index = values.len() as u32;
+            if !unsafe { extension.to_main.unwrap()(plugin, port, index, &mut id, &mut value) } {
+                return values;
+            }
+            values.push((id, value));
+        }
+    }
+
+    #[test]
+    fn a_port_says_what_sends_its_parts_back_to_main() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let wrapper = wrapper::<Routing>(&host);
+        set(&wrapper, "first", 2.0);
+        set(&wrapper, "second", 2.0);
+        let id = |id: &str| wrapper.param_id_to_hash[id];
+        // A value as `params` gives one: a stepped parameter's step, the level's 4.
+        assert_eq!(
+            to_main(&wrapper, 3),
+            [(id("first"), 0.0), (id("second"), 0.0), (id("level"), 4.0)],
+            "port 3, output 2"
+        );
+        assert_eq!(to_main(&wrapper, 2), [], "nothing on output 1");
+        assert_eq!(to_main(&wrapper, 1), [], "an input");
+        set(&wrapper, "second", 1.0);
+        assert_eq!(
+            to_main(&wrapper, 2),
+            [(id("second"), 0.0), (id("level"), 4.0)]
+        );
+    }
+
+    #[test]
+    fn a_state_load_that_routes_a_part_tells_the_host() {
+        let probe = Probe::default();
+        let host = host(&probe);
+        let wrapper = wrapper::<Routing>(&host);
+        let mut state = wrapper.get_state_object();
+        state.params.insert("first".to_owned(), ParamValue::I32(1));
+        wrapper.set_state_object_from_gui(state);
+        assert_eq!(changed(&probe), 1);
+        assert_eq!(outputs(&wrapper), [(2, "Kick".to_owned())]);
     }
 }
 
