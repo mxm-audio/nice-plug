@@ -3,7 +3,7 @@
 **Since 2026-10-06 this is `nice-plug 0.4.2` exactly as published on crates.io**, plus the MXM
 patches that 0.4.2 has not made redundant: seven of the eleven numbered fixes (1, 2, 7, 8, 9, 10 and
 11; 1, 2 and 8 reworked for 0.4.2) and the capability changes: note names on 2026-10-14, floating
-windows' `set_transient` on 2026-10-15, host keys on 2026-10-16, presets on 2026-10-27, outputs in use on 2026-11-19; and one lint, an `allow` on upstream's
+windows' `set_transient` on 2026-10-15, host keys on 2026-10-16, presets on 2026-10-27, outputs in use on 2026-11-19; a fix, the latency told only inside `activate`, on 2026-11-23; and one lint, an `allow` on upstream's
 `vst3` test casts that Clippy 1.98 refuses (`MXM PATCH (lint)`). Fixes 3, 4, 5 and 6 were dropped because 0.4.2 does the same thing. The numbering is unchanged, so every older reference
 still resolves. See [*Refresh to 0.4.2*](#refresh-to-042--2026-10-06) for the per-patch status.
 
@@ -809,6 +809,19 @@ test indexer and receiver, the folder asked for by the plugin's id and version; 
 `mxm_preset_load_tests` (only a plugin with a loader offers the extension; a load reaches the
 loader and the host hears `loaded`; a refusal and a location that isn't a file reach the host's
 `on_error` with why). The presets patch builds with and without `editor`.
+
+## Latency told only inside `activate` — a fix (2026-11-23)
+
+**CLAP lets a plugin's latency change only inside `activate`, and `clap_host_latency::changed` be
+called only there** (`latency.h`: "If the plugin is activated, call `host->request_restart()`").
+Upstream did so for an active plugin, but told a deactivated plugin's host at once, from the main
+thread, outside `activate`. clap-validator refuses that ("Must only be called within
+'clap_plugin::activate'"); it showed in mxm-fx-pitch, whose *Mode* is a new latency, when the
+validator's parameter tests set *Mode* and deactivated it before the change reached the main thread.
+**The change is now always remembered (`latency_changed`) and told by the next `activate`**, an
+active plugin asking for its restart as before. `MXM PATCH (latency outside activate)` in
+`src/wrapper/clap/wrapper.rs`. VST3 is unchanged: its `restartComponent(kLatencyChanged)` is
+VST3's own way.
 
 ## Outputs in use — a capability, not a fix
 

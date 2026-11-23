@@ -584,18 +584,16 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                 Some(host_latency) => {
                     crate::nice_debug_assert!(is_gui_thread);
 
-                    // The plugin needs to be deactivated in order for the latency to change. If
-                    // it's already deactivated we can notify the host immediately, otherwise we
-                    // need to request a restart and remember to notify the host of the latency
-                    // change in the `activate` function.
-                    //
-                    // In practice, ignoring the activation status would be fine for many hosts, but
-                    // following the specification is probably a good idea regardless :)
+                    // MXM PATCH (latency outside activate): CLAP lets the latency change only
+                    // inside `activate`, and `changed` be called only there. Active, the plugin
+                    // asks for a restart; either way the change is remembered and the next
+                    // `activate` tells the host. Upstream told a deactivated plugin's host at once,
+                    // which clap-validator refuses ("Must only be called within
+                    // 'clap_plugin::activate'").
+                    let _ = host_latency;
+                    self.latency_changed.store(true, Ordering::SeqCst);
                     if self.is_activated.load(Ordering::SeqCst) {
-                        self.latency_changed.store(true, Ordering::SeqCst);
                         self.request_restart();
-                    } else {
-                        unsafe_clap_call! { host_latency=>changed(&*self.host_callback) };
                     }
                 }
                 None => {
