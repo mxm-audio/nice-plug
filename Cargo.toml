@@ -90,6 +90,12 @@ path = "tests/derive_params.rs"
 name = "derive_persist"
 path = "tests/derive_persist.rs"
 
+# MXM PATCH (ARA): an ARA plugin and a plain one exported through both formats (`PATCHES.md`, *ARA*).
+[[test]]
+name = "ara"
+path = "tests/ara.rs"
+required-features = ["vst3"]
+
 [dependencies.anyhow]
 version = "1.0.104"
 

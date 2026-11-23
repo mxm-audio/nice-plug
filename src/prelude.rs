@@ -44,6 +44,8 @@ pub use crate::wrapper::clap::features::ClapFeature;
 pub use crate::wrapper::clap::{ClapNoteNames, ClapPlugin, NoteName, PolyModulationConfig};
 // MXM PATCH (outputs in use): `OutputsInUse` and `OutputInUse`, for CLAP and VST3.
 pub use crate::wrapper::outputs_in_use::{OutputInUse, OutputsInUse};
+// MXM PATCH (ARA)
+pub use crate::wrapper::ara::AraHooks;
 // MXM PATCH (presets): the preset capability.
 #[cfg(feature = "editor")]
 pub use crate::wrapper::clap::ClapPresetLoader;

@@ -49,8 +49,9 @@ use vst3::Steinberg::{FUnknown, FUnknownVtbl, TUID, int32, tresult};
 use vst3::com_scrape_types::{Class, Construct, Guid, Header, Inherits, Unknown, Wrapper};
 use vst3::{ComPtr, Interface};
 
-/// A [`TUID`] as the [`Guid`] an [`Interface`] declares.
-const fn guid(tuid: TUID) -> Guid {
+/// A [`TUID`] as the [`Guid`] an [`Interface`] declares. MXM PATCH (ARA): shared with ARA's
+/// interfaces (`super::ara`).
+pub(crate) const fn guid(tuid: TUID) -> Guid {
     let mut guid = [0; 16];
     let mut i = 0;
     while i < 16 {
@@ -160,7 +161,8 @@ pub(crate) fn copy_name(dest: &mut String128, name: &str) {
 }
 
 /// `Unknown`, `Interface` and `Inherits<FUnknown>` for an interface whose vtable begins with
-/// `FUnknown`'s, as the generated bindings implement them.
+/// `FUnknown`'s, as the generated bindings implement them. MXM PATCH (ARA): shared with ARA's
+/// interfaces (`super::ara`).
 macro_rules! interface {
     ($interface:ident, $vtbl:ident, $a:literal, $b:literal, $c:literal, $d:literal) => {
         // SAFETY: a pointer to the vtable, as COM lays out every interface.
@@ -200,6 +202,8 @@ macro_rules! interface {
     };
 }
 
+pub(crate) use interface;
+
 interface!(
     IOutputsInUse,
     IOutputsInUseVtbl,
@@ -222,7 +226,9 @@ interface!(
 /// # Safety
 ///
 /// `this` must be the interface pointer `W` made for a live object of `C`, at `OFFSET`.
-unsafe fn object<'a, C: Class, W: Wrapper<C>, const OFFSET: isize, I>(this: *mut I) -> &'a C {
+pub(crate) unsafe fn object<'a, C: Class, W: Wrapper<C>, const OFFSET: isize, I>(
+    this: *mut I,
+) -> &'a C {
     // SAFETY: the caller's.
     unsafe {
         let header = (this as *mut u8).offset(-OFFSET) as *mut Header<C>;

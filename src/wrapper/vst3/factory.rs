@@ -30,6 +30,10 @@ const K_FACTORY_FLAG_UNICODE: i32 = FactoryFlags_::kUnicode as i32;
 #[derive(Debug)]
 pub struct PluginInfo {
     pub cid: &'static [u8; 16],
+    // MXM PATCH (ARA): "Audio Module Class", or an ARA main factory class's, which also keeps the
+    // plugin's factory.
+    pub category: &'static str,
+    pub ara_factory: Option<fn() -> *const std::ffi::c_void>,
     pub name: &'static str,
     pub subcategories: String,
     pub vendor: &'static str,
@@ -44,6 +48,8 @@ impl PluginInfo {
     pub fn for_plugin<P: Vst3Plugin>() -> PluginInfo {
         PluginInfo {
             cid: &P::PLATFORM_VST3_CLASS_ID,
+            category: "Audio Module Class",
+            ara_factory: None,
             name: P::NAME,
             subcategories: make_subcategories_string::<P>(),
             vendor: P::VENDOR,
@@ -51,6 +57,22 @@ impl PluginInfo {
             url: P::URL,
             email: P::EMAIL,
         }
+    }
+
+    // MXM PATCH (ARA): `P`'s ARA main factory class, if it offers ARA. ARA wants the class's name
+    // to be the plugin's (`ARAVST3.h`).
+    pub fn for_ara<P: Vst3Plugin>() -> Option<PluginInfo> {
+        P::VST3_ARA.map(|hooks| PluginInfo {
+            cid: &P::PLATFORM_VST3_ARA_CLASS_ID,
+            category: super::ara::ARA_MAIN_FACTORY_CLASS,
+            ara_factory: Some(hooks.factory),
+            name: P::NAME,
+            subcategories: String::new(),
+            vendor: P::VENDOR,
+            version: P::VERSION,
+            url: P::URL,
+            email: P::EMAIL,
+        })
     }
 
     /// Fill a [`PFactoryInfo`] struct with the information from this library. Used in
@@ -71,7 +93,7 @@ impl PluginInfo {
         let mut info: PClassInfo = unsafe { std::mem::zeroed() };
         info.cid = self.cid.map(|b| b as std::ffi::c_char);
         info.cardinality = K_CLASS_CARDINALITY_MANY_INSTANCES;
-        strlcpy(&mut info.category, "Audio Module Class");
+        strlcpy(&mut info.category, self.category);
         strlcpy(&mut info.name, self.name);
 
         info
@@ -83,7 +105,7 @@ impl PluginInfo {
         let mut info: PClassInfo2 = unsafe { std::mem::zeroed() };
         info.cid = self.cid.map(|b| b as std::ffi::c_char);
         info.cardinality = K_CLASS_CARDINALITY_MANY_INSTANCES;
-        strlcpy(&mut info.category, "Audio Module Class");
+        strlcpy(&mut info.category, self.category);
         strlcpy(&mut info.name, self.name);
         #[allow(clippy::unnecessary_cast)]
         {
@@ -103,7 +125,7 @@ impl PluginInfo {
         let mut info: PClassInfoW = unsafe { std::mem::zeroed() };
         info.cid = self.cid.map(|b| b as std::ffi::c_char);
         info.cardinality = K_CLASS_CARDINALITY_MANY_INSTANCES;
-        strlcpy(&mut info.category, "Audio Module Class");
+        strlcpy(&mut info.category, self.category);
         u16strlcpy(&mut info.name, self.name);
         #[allow(clippy::unnecessary_cast)]
         {

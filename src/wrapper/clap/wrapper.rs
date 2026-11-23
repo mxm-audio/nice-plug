@@ -119,6 +119,10 @@ use crate::wrapper::clap::context::RemoteControlPages;
 use crate::wrapper::clap::context::WrapperGuiContext;
 // MXM PATCH (note names)
 use crate::wrapper::clap::note_names::NoteNames;
+// MXM PATCH (ARA)
+use crate::wrapper::clap::ara::{
+    CLAP_EXT_ARA_PLUGINEXTENSION, CLAP_EXT_ARA_PLUGINEXTENSION_COMPAT, clap_ara_plugin_extension,
+};
 // MXM PATCH (outputs in use)
 use crate::wrapper::clap::outputs_in_use::{
     DK_MXM_EXT_OUTPUTS_IN_USE, copy_name, dk_mxm_host_outputs_in_use, dk_mxm_plugin_outputs_in_use,
@@ -319,6 +323,8 @@ pub struct Wrapper<P: ClapPlugin> {
     // outputs it sends to; the host's side, queried in `init`; and what they are and whether the
     // host must be told.
     clap_plugin_outputs_in_use: dk_mxm_plugin_outputs_in_use,
+    // MXM PATCH (ARA): offered only by a plugin whose `CLAP_ARA` is set.
+    clap_plugin_ara: clap_ara_plugin_extension,
     host_outputs_in_use: AtomicRefCell<Option<ClapPtr<dk_mxm_host_outputs_in_use>>>,
     outputs_in_use: Option<UsedOutputs>,
 
@@ -1042,6 +1048,12 @@ impl<P: ClapPlugin> Wrapper<P> {
             },
             host_outputs_in_use: AtomicRefCell::new(None),
             outputs_in_use,
+
+            // MXM PATCH (ARA)
+            clap_plugin_ara: clap_ara_plugin_extension {
+                get_factory: Some(Self::ext_ara_get_factory),
+                bind_to_document_controller: Some(Self::ext_ara_bind),
+            },
 
             // MXM PATCH (presets)
             #[cfg(feature = "editor")]
@@ -3006,6 +3018,13 @@ impl<P: ClapPlugin> Wrapper<P> {
             } else {
                 std::ptr::null()
             }
+        } else if id == CLAP_EXT_ARA_PLUGINEXTENSION || id == CLAP_EXT_ARA_PLUGINEXTENSION_COMPAT {
+            // MXM PATCH (ARA): only for a plugin that offers ARA.
+            if P::CLAP_ARA.is_some() {
+                &wrapper.clap_plugin_ara as *const _ as *const c_void
+            } else {
+                std::ptr::null()
+            }
         } else if id == CLAP_EXT_REMOTE_CONTROLS {
             &wrapper.clap_plugin_remote_controls as *const _ as *const c_void
         } else if id == CLAP_EXT_RENDER {
@@ -3027,6 +3046,44 @@ impl<P: ClapPlugin> Wrapper<P> {
         } else {
             crate::nice_trace!("Host tried to query unknown extension {:?}", id);
             std::ptr::null()
+        }
+    }
+
+    // MXM PATCH (ARA): the plugin extension's two calls (`ARACLAP.h`).
+    unsafe extern "C" fn ext_ara_get_factory(plugin: *const clap_plugin) -> *const c_void {
+        check_null_ptr!(std::ptr::null(), plugin, unsafe { (*plugin).plugin_data });
+        P::CLAP_ARA.map_or(std::ptr::null(), |hooks| (hooks.factory)())
+    }
+
+    // MXM PATCH (ARA): binds the instance, on the main thread, before it is first activated (the
+    // host's promise, `ARACLAP.h`); the plugin's own `bind` makes its extension instance.
+    unsafe extern "C" fn ext_ara_bind(
+        plugin: *const clap_plugin,
+        document_controller: *const c_void,
+        known_roles: u32,
+        assigned_roles: u32,
+    ) -> *const c_void {
+        check_null_ptr!(
+            std::ptr::null(),
+            plugin,
+            unsafe { (*plugin).plugin_data },
+            document_controller
+        );
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+        let Some(hooks) = P::CLAP_ARA else {
+            return std::ptr::null();
+        };
+        match wrapper.plugin.try_lock() {
+            Some(mut plugin) => (hooks.bind)(
+                &mut plugin,
+                document_controller,
+                known_roles,
+                assigned_roles,
+            ),
+            None => {
+                crate::nice_debug_assert_failure!("bound to ARA while the plugin is in use");
+                std::ptr::null()
+            }
         }
     }
 
@@ -5732,5 +5789,182 @@ mod mxm_preset_load_tests {
             "only a preset file can be loaded"
         );
         assert_eq!(probe.loaded.lock().unwrap().len(), 1, "nothing else loaded");
+    }
+}
+
+// MXM PATCH (ARA): the plugin extension (`PATCHES.md`, *ARA*).
+#[cfg(test)]
+mod mxm_ara_tests {
+    use super::Wrapper;
+    use crate::prelude::*;
+    use crate::wrapper::clap::ara::{
+        CLAP_EXT_ARA_PLUGINEXTENSION, CLAP_EXT_ARA_PLUGINEXTENSION_COMPAT,
+        clap_ara_plugin_extension,
+    };
+    use clap_sys::host::clap_host;
+    use clap_sys::plugin::clap_plugin;
+    use clap_sys::version::CLAP_VERSION;
+    use std::ffi::{CStr, c_char, c_void};
+    use std::sync::Arc;
+
+    unsafe extern "C" fn nothing(_host: *const clap_host) {}
+
+    unsafe extern "C" fn no_extension(
+        _host: *const clap_host,
+        _id: *const c_char,
+    ) -> *const c_void {
+        std::ptr::null()
+    }
+
+    fn host() -> Box<clap_host> {
+        Box::new(clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: std::ptr::null_mut(),
+            name: c"ara-test".as_ptr(),
+            vendor: c"mxm".as_ptr(),
+            url: c"".as_ptr(),
+            version: c"1".as_ptr(),
+            get_extension: Some(no_extension),
+            request_restart: Some(nothing),
+            request_process: Some(nothing),
+            request_callback: Some(nothing),
+        })
+    }
+
+    /// Stands for an `ARAFactory`: only its address is handed on.
+    static FACTORY: u8 = 0;
+    /// Stands for an `ARAPlugInExtensionInstance`.
+    static INSTANCE: u8 = 0;
+
+    fn factory() -> *const c_void {
+        (&raw const FACTORY).cast()
+    }
+
+    #[derive(Default)]
+    struct Params0;
+
+    unsafe impl Params for Params0 {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+
+    macro_rules! test_plugin {
+        ($name:ident, $id:literal, $ara:expr) => {
+            #[derive(Default)]
+            struct $name {
+                params: Arc<Params0>,
+                /// What it was bound with: the document controller and its roles.
+                #[allow(dead_code)]
+                bound: Option<(usize, u32, u32)>,
+            }
+
+            impl Plugin for $name {
+                const NAME: &'static str = "ARA";
+                const VENDOR: &'static str = "MXM";
+                const URL: &'static str = "";
+                const EMAIL: &'static str = "";
+                const VERSION: &'static str = "1";
+                const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+                    main_input_channels: Some(new_nonzero_u32(2)),
+                    main_output_channels: Some(new_nonzero_u32(2)),
+                    ..AudioIOLayout::const_default()
+                }];
+                type Editor = ();
+                type SysExMessage = ();
+                type BackgroundTask = ();
+
+                fn params(&self) -> Arc<dyn Params> {
+                    self.params.clone()
+                }
+
+                fn process(
+                    &mut self,
+                    _buffer: &mut Buffer,
+                    _aux: &mut AuxiliaryBuffers,
+                    _context: &mut impl ProcessContext<Self>,
+                ) -> ProcessStatus {
+                    ProcessStatus::Normal
+                }
+            }
+
+            impl ClapPlugin for $name {
+                const CLAP_ID: &'static str = $id;
+                const CLAP_DESCRIPTION: Option<&'static str> = None;
+                const CLAP_MANUAL_URL: Option<&'static str> = None;
+                const CLAP_SUPPORT_URL: Option<&'static str> = None;
+                const CLAP_FEATURES: &'static [ClapFeature] = &[];
+                const CLAP_ARA: Option<AraHooks<Self>> = $ara;
+            }
+        };
+    }
+
+    test_plugin!(
+        Offering,
+        "dk.mxm.test.ara",
+        Some(AraHooks {
+            factory,
+            bind: |plugin: &mut Offering, controller, known, assigned| {
+                plugin.bound = Some((controller as usize, known, assigned));
+                (&raw const INSTANCE).cast()
+            },
+            vst3_main_factory_class_id: [1; 16],
+        })
+    );
+    test_plugin!(Plain, "dk.mxm.test.plain", None);
+
+    fn wrapper<P: ClapPlugin>(host: &clap_host) -> Arc<Wrapper<P>> {
+        let wrapper = unsafe { Wrapper::<P>::new(host) };
+        assert!(unsafe { Wrapper::<P>::init(plugin(&wrapper)) });
+        wrapper
+    }
+
+    fn plugin<P: ClapPlugin>(wrapper: &Wrapper<P>) -> *const clap_plugin {
+        wrapper.clap_plugin.as_ptr()
+    }
+
+    fn extension<P: ClapPlugin>(wrapper: &Wrapper<P>, id: &CStr) -> *const c_void {
+        unsafe { Wrapper::<P>::get_extension(plugin(wrapper), id.as_ptr()) }
+    }
+
+    /// A plugin that offers ARA answers the extension, by its id and its draft id, hands over its
+    /// factory, and is bound through its own hook with what the host gave.
+    #[test]
+    fn a_plugin_that_offers_ara_is_bound_through_its_hook() {
+        let host = host();
+        let wrapper = wrapper::<Offering>(&host);
+        for id in [
+            CLAP_EXT_ARA_PLUGINEXTENSION,
+            CLAP_EXT_ARA_PLUGINEXTENSION_COMPAT,
+        ] {
+            assert!(!extension(&wrapper, id).is_null(), "{id:?} offered");
+        }
+        let ara = unsafe {
+            &*extension(&wrapper, CLAP_EXT_ARA_PLUGINEXTENSION).cast::<clap_ara_plugin_extension>()
+        };
+        let plugin = plugin(&wrapper);
+        assert_eq!(unsafe { ara.get_factory.unwrap()(plugin) }, factory());
+        let controller = 0x1234usize as *const c_void;
+        let instance =
+            unsafe { ara.bind_to_document_controller.unwrap()(plugin, controller, 7, 1) };
+        assert_eq!(instance, (&raw const INSTANCE).cast());
+        assert_eq!(
+            wrapper.plugin.try_lock().unwrap().bound,
+            Some((0x1234, 7, 1)),
+            "the hook was given the document controller and the roles"
+        );
+    }
+
+    /// A plugin that doesn't offer ARA answers neither id: it is as it was.
+    #[test]
+    fn a_plugin_without_ara_offers_no_extension() {
+        let host = host();
+        let wrapper = wrapper::<Plain>(&host);
+        for id in [
+            CLAP_EXT_ARA_PLUGINEXTENSION,
+            CLAP_EXT_ARA_PLUGINEXTENSION_COMPAT,
+        ] {
+            assert!(extension(&wrapper, id).is_null(), "{id:?} not offered");
+        }
     }
 }

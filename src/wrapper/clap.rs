@@ -1,6 +1,8 @@
 #[macro_use]
 mod util;
 
+// MXM PATCH (ARA): ARA's CLAP companion API, see `ClapPlugin::CLAP_ARA`.
+pub mod ara;
 mod context;
 mod descriptor;
 pub mod features;
@@ -12,6 +14,8 @@ pub mod outputs_in_use;
 pub mod presets;
 mod wrapper;
 
+// MXM PATCH (ARA)
+use crate::wrapper::ara::AraHooks;
 use crate::wrapper::clap::features::ClapFeature;
 // MXM PATCH (outputs in use): the source, shared with the VST3 wrapper.
 use crate::wrapper::outputs_in_use::OutputsInUse;
@@ -100,6 +104,12 @@ pub trait ClapPlugin: Plugin {
     /// `None`, the default, offers no preset-discovery factory. Read without an instance: a
     /// host indexes presets without creating the plugin.
     const CLAP_PRESETS: Option<ClapPresets> = None;
+
+    // MXM PATCH (ARA): a capability, not a fix. See `PATCHES.md`, *ARA*.
+    /// A plugin that offers ARA 2 through CLAP: its factory and its binding
+    /// (`crate::wrapper::ara`). `None`, the default, offers neither the ARA factory nor the plugin
+    /// extension.
+    const CLAP_ARA: Option<AraHooks<Self>> = None;
 
     // MXM PATCH (presets): a capability, not a fix. See `PATCHES.md`, *Presets*.
     /// What loads a preset file for a host, through CLAP's
@@ -268,6 +278,13 @@ macro_rules! nice_export_clap {
                     // MXM PATCH (presets): one provider for each plugin with presets.
                     $crate::wrapper::clap::presets::factory(|| {
                         vec![$($crate::wrapper::clap::presets::PresetProvider::for_plugin::<$plugin_ty>()),+]
+                    })
+                } else if factory_id == $crate::wrapper::clap::ara::CLAP_EXT_ARA_FACTORY
+                    || factory_id == $crate::wrapper::clap::ara::CLAP_EXT_ARA_FACTORY_COMPAT
+                {
+                    // MXM PATCH (ARA): the plugins that offer ARA, with their `ARAFactory`s.
+                    $crate::wrapper::clap::ara::factory(|| {
+                        vec![$($crate::wrapper::clap::ara::AraEntry::for_plugin::<$plugin_ty>()),+]
                     })
                 } else {
                     ::std::ptr::null()

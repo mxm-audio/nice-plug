@@ -45,6 +45,11 @@ use super::inner::{InProcess, ProcessEvent, WrapperInner};
 use super::note_expressions;
 // MXM PATCH (outputs in use)
 use super::outputs_in_use::{IOutputsInUse, IOutputsInUseTrait, copy_name};
+// MXM PATCH (ARA)
+use super::ara::{
+    ALL_ROLES, AraFiltered, IPlugInEntryPoint, IPlugInEntryPoint2, IPlugInEntryPoint2Trait,
+    IPlugInEntryPointTrait,
+};
 use super::util::{VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START, u16strlcpy};
 use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
 use crate::util::permit_alloc;
@@ -73,19 +78,26 @@ pub struct Wrapper<P: Vst3Plugin> {
 }
 
 impl<P: Vst3Plugin> Class for Wrapper<P> {
-    type Interfaces = (
-        IComponent,
-        IEditController,
-        IAudioProcessor,
-        IMidiMapping,
-        INoteExpressionController,
-        IProcessContextRequirements,
-        IUnitInfo,
-        IInfoListener,
-        // MXM PATCH (outputs in use): offered by every plugin; one that doesn't say which outputs
-        // it sends to answers `kNotImplemented`.
-        IOutputsInUse,
-    );
+    // MXM PATCH (ARA): ARA's two entry points answered only by a plugin that offers ARA
+    // (`AraFiltered`).
+    type Interfaces = AraFiltered<
+        P,
+        (
+            IComponent,
+            IEditController,
+            IAudioProcessor,
+            IMidiMapping,
+            INoteExpressionController,
+            IProcessContextRequirements,
+            IUnitInfo,
+            IInfoListener,
+            // MXM PATCH (outputs in use): offered by every plugin; one that doesn't say which
+            // outputs it sends to answers `kNotImplemented`.
+            IOutputsInUse,
+            IPlugInEntryPoint,
+            IPlugInEntryPoint2,
+        ),
+    >;
 }
 
 impl<P: Vst3Plugin> Wrapper<P> {
@@ -1894,6 +1906,46 @@ impl<P: Vst3Plugin> IUnitInfoTrait for Wrapper<P> {
 }
 
 // MXM PATCH (outputs in use): a capability, not a fix. See `PATCHES.md`, *Outputs in use*.
+// MXM PATCH (ARA): ARA's entry points (`ARAVST3.h`), the binding on the main thread, before the
+// plugin is first activated (the host's promise).
+impl<P: Vst3Plugin> IPlugInEntryPointTrait for Wrapper<P> {
+    unsafe fn getFactory(&self) -> *const c_void {
+        P::VST3_ARA.map_or(std::ptr::null(), |hooks| (hooks.factory)())
+    }
+
+    unsafe fn bindToDocumentController(&self, document_controller: *const c_void) -> *const c_void {
+        unsafe { self.bindToDocumentControllerWithRoles(document_controller, ALL_ROLES, ALL_ROLES) }
+    }
+}
+
+impl<P: Vst3Plugin> IPlugInEntryPoint2Trait for Wrapper<P> {
+    unsafe fn bindToDocumentControllerWithRoles(
+        &self,
+        document_controller: *const c_void,
+        known_roles: u32,
+        assigned_roles: u32,
+    ) -> *const c_void {
+        let Some(hooks) = P::VST3_ARA else {
+            return std::ptr::null();
+        };
+        if document_controller.is_null() {
+            return std::ptr::null();
+        }
+        match self.inner.plugin.try_lock() {
+            Some(mut plugin) => (hooks.bind)(
+                &mut plugin,
+                document_controller,
+                known_roles,
+                assigned_roles,
+            ),
+            None => {
+                crate::nice_debug_assert_failure!("bound to ARA while the plugin is in use");
+                std::ptr::null()
+            }
+        }
+    }
+}
+
 impl<P: Vst3Plugin> IOutputsInUseTrait for Wrapper<P> {
     unsafe fn getOutputCount(&self, count: *mut int32) -> tresult {
         check_null_ptr!(count);

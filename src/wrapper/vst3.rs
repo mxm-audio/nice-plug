@@ -1,6 +1,8 @@
 #[macro_use]
 mod util;
 
+// MXM PATCH (ARA): ARA's VST3 companion API, see `Vst3Plugin::VST3_ARA`.
+pub mod ara;
 mod context;
 mod factory;
 mod inner;
@@ -20,6 +22,8 @@ use nice_plug_core::plugin::Plugin;
 pub use vst3;
 pub use wrapper::Wrapper;
 
+// MXM PATCH (ARA)
+use crate::wrapper::ara::AraHooks;
 use crate::wrapper::outputs_in_use::OutputsInUse;
 use crate::wrapper::vst3::subcategories::Vst3SubCategory;
 use std::sync::Arc;
@@ -54,6 +58,20 @@ pub trait Vst3Plugin: Plugin {
     /// [`VST3_CLASS_ID`][Self::VST3_CLASS_ID`] in the correct order for the current platform so
     /// projects and presets can be shared between platforms. This should not be overridden.
     const PLATFORM_VST3_CLASS_ID: [u8; 16] = swap_vst3_uid_byte_order(Self::VST3_CLASS_ID);
+
+    // MXM PATCH (ARA): a capability, not a fix. See `PATCHES.md`, *ARA*.
+    /// A plugin that offers ARA 2 through VST3: its factory, its binding and its ARA main factory
+    /// class's ID (`crate::wrapper::ara`). `None`, the default, lists no main factory class and
+    /// answers neither `IPlugInEntryPoint` nor `IPlugInEntryPoint2`.
+    const VST3_ARA: Option<AraHooks<Self>> = None;
+
+    // MXM PATCH (ARA): the main factory class's ID in this platform's byte order, as
+    // `PLATFORM_VST3_CLASS_ID` is.
+    #[doc(hidden)]
+    const PLATFORM_VST3_ARA_CLASS_ID: [u8; 16] = match Self::VST3_ARA {
+        Some(hooks) => swap_vst3_uid_byte_order(hooks.vst3_main_factory_class_id),
+        None => [0; 16],
+    };
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -110,8 +128,10 @@ macro_rules! nice_export_vst3 {
 
             #[doc(hidden)]
             pub struct Factory {
-                // This is a type erased version of the information stored on the plugin types
-                plugin_infos: [PluginInfo; PLUGIN_COUNT],
+                // This is a type erased version of the information stored on the plugin types.
+                // MXM PATCH (ARA): the plugins' classes first, in the macro's order, then the ARA
+                // main factory class of each that offers ARA.
+                plugin_infos: Vec<PluginInfo>,
             }
 
             impl Class for Factory {
@@ -120,7 +140,9 @@ macro_rules! nice_export_vst3 {
 
             impl Factory {
                 pub fn new() -> Self {
-                    let plugin_infos = [$(PluginInfo::for_plugin::<$plugin_ty>()),+];
+                    let mut plugin_infos = vec![$(PluginInfo::for_plugin::<$plugin_ty>()),+];
+                    // MXM PATCH (ARA)
+                    plugin_infos.extend([$(PluginInfo::for_ara::<$plugin_ty>()),+].into_iter().flatten());
 
                     if cfg!(debug_assertions) {
                         let unique_cids: HashSet<[u8; 16]> = plugin_infos.iter().map(|d| *d.cid).collect();
@@ -191,6 +213,21 @@ macro_rules! nice_export_vst3 {
 
                             plugin_idx += 1;
                         })+
+
+                        // MXM PATCH (ARA): an ARA main factory class hands over its plugin's
+                        // `ARAFactory` (`IMainFactory`).
+                        for plugin_info in &self.plugin_infos[PLUGIN_COUNT..] {
+                            if cid == plugin_info.cid
+                                && let Some(factory) = plugin_info.ara_factory
+                            {
+                                let main_factory = ComWrapper::new(
+                                    $crate::wrapper::vst3::ara::AraMainFactory { factory },
+                                );
+                                let unknown = main_factory.as_com_ref::<FUnknown>().unwrap();
+                                let ptr = unknown.as_ptr();
+                                return ((*(*ptr).vtbl).queryInterface)(ptr, iid as *const TUID, obj);
+                            }
+                        }
                     }
 
                     kInvalidArgument

@@ -3,7 +3,7 @@
 **Since 2026-10-06 this is `nice-plug 0.4.2` exactly as published on crates.io**, plus the MXM
 patches that 0.4.2 has not made redundant: seven of the eleven numbered fixes (1, 2, 7, 8, 9, 10 and
 11; 1, 2 and 8 reworked for 0.4.2) and the capability changes: note names on 2026-10-14, floating
-windows' `set_transient` on 2026-10-15, host keys on 2026-10-16, presets on 2026-10-27, outputs in use on 2026-11-19; a fix, the latency told only inside `activate`, on 2026-11-23; and one lint, an `allow` on upstream's
+windows' `set_transient` on 2026-10-15, host keys on 2026-10-16, presets on 2026-10-27, outputs in use on 2026-11-19; a fix, the latency told only inside `activate`, on 2026-11-23; ARA, a capability, the same day; and one lint, an `allow` on upstream's
 `vst3` test casts that Clippy 1.98 refuses (`MXM PATCH (lint)`). Fixes 3, 4, 5 and 6 were dropped because 0.4.2 does the same thing. The numbering is unchanged, so every older reference
 still resolves. See [*Refresh to 0.4.2*](#refresh-to-042--2026-10-06) for the per-patch status.
 
@@ -14,14 +14,14 @@ root `Cargo.toml`.
 Every change is marked `MXM PATCH` in the source, so `grep -rn "MXM PATCH" src/` finds the complete
 delta. Since the 0.4.2 refresh it lives in `src/wrapper/clap/wrapper.rs`, `src/wrapper/state.rs`
 and the one re-export in `src/wrapper.rs`; the note names add `src/wrapper/clap.rs`,
-`src/wrapper/clap/note_names.rs` and `src/prelude.rs`; the presets add `src/wrapper/clap/presets.rs`; the outputs in use add `src/wrapper/outputs_in_use.rs`, `src/wrapper/clap/outputs_in_use.rs`, `src/wrapper/vst3/outputs_in_use.rs`, and hunks in `src/wrapper/vst3.rs`, `src/wrapper/vst3/inner.rs` and `src/wrapper/vst3/wrapper.rs`. Hunks reworked by the refresh say
+`src/wrapper/clap/note_names.rs` and `src/prelude.rs`; the presets add `src/wrapper/clap/presets.rs`; ARA adds `src/wrapper/ara.rs`, `src/wrapper/clap/ara.rs`, `src/wrapper/vst3/ara.rs`, `tests/ara.rs` and hunks in `src/wrapper/vst3.rs`, `src/wrapper/vst3/factory.rs`, `src/wrapper/vst3/wrapper.rs` and `src/wrapper/vst3/outputs_in_use.rs`; the outputs in use add `src/wrapper/outputs_in_use.rs`, `src/wrapper/clap/outputs_in_use.rs`, `src/wrapper/vst3/outputs_in_use.rs`, and hunks in `src/wrapper/vst3.rs`, `src/wrapper/vst3/inner.rs` and `src/wrapper/vst3/wrapper.rs`. Hunks reworked by the refresh say
 `refreshed onto 0.4.2` in their marker. *(0.3.0, superseded: it lived in
 `src/wrapper/clap/wrapper.rs` and `src/wrapper/state.rs`, plus the output-push guard in
 `src/wrapper/clap/context.rs`. 0.4 removed the wrapper's output queue that the guard bounded.)*
 
 **The four capabilities are different in kind from the eleven** — they are not defect fixes. See
 *GUI-authored state dirty*, *Floating windows*, *GUI-task process wake*, *Note names*,
-*Host keys*, *Presets* and *Outputs in use*, below.
+*Host keys*, *Presets*, *Outputs in use* and *ARA*, below.
 
 ## Refresh to 0.4.2 — 2026-10-06
 
@@ -809,6 +809,38 @@ test indexer and receiver, the folder asked for by the plugin's id and version; 
 `mxm_preset_load_tests` (only a plugin with a loader offers the extension; a load reaches the
 loader and the host hears `loaded`; a refusal and a location that isn't a file reach the host's
 `on_error` with why). The presets patch builds with and without `editor`.
+
+## ARA — a capability, not a fix (2026-11-23)
+
+**A plugin may offer ARA 2** (Celemony's Audio Random Access: a host gives the plugin its
+recordings, for mxm-fx-pitch's Studio; newDAWn's `plans/plan-pitch-plugin.md`, the owner,
+2026-11-23: "With ARA support for the studio mode") **through both companion APIs**, ARA SDK 2.3's
+`ARACLAP.h` and `ARAVST3.h`. nice-plug knows ARA's objects only as pointers: the plugin brings its
+own ARA implementation, and the wrappers hand the host its factory and bind an instance.
+
+- **Opt-in, one value for both formats**: `ClapPlugin::CLAP_ARA` and `Vst3Plugin::VST3_ARA`, an
+  `AraHooks` (`src/wrapper/ara.rs`): the `ARAFactory` pointer, the binding (`&mut P`, the document
+  controller, the known and assigned roles, giving the `ARAPlugInExtensionInstance` pointer), and
+  the ARA main factory class's VST3 ID. `None`, the default, changes nothing: a test exports a plain
+  plugin beside an ARA one and finds it as before in both formats.
+- **CLAP** (`src/wrapper/clap/ara.rs`): `get_factory` answers `org.ara-audio.ara.factory/2` (and
+  the draft id) with a factory listing the library's ARA plugins, each with its `ARAFactory` and
+  CLAP id; `get_extension` answers `org.ara-audio.ara.pluginextension/2` (and the draft id) for an
+  ARA plugin only, its `bind_to_document_controller` calling the hook with the plugin locked on the
+  main thread. A host must bind before the first `activate`, state load or GUI (`ARACLAP.h`); a
+  plugin found in use is a debug assertion and binds nothing.
+- **VST3** (`src/wrapper/vst3/ara.rs`): the factory lists, after the plugins' classes, one class of
+  category `"ARA Main Factory Class"` per ARA plugin, named as the plugin (ARA asks it), whose
+  object answers `IMainFactory::getFactory`; the component answers `IPlugInEntryPoint` (the
+  deprecated `bindToDocumentController` binding every role) and `IPlugInEntryPoint2`. **A plugin
+  without ARA answers neither**: the component's interface list is `AraFiltered`, the tuple with
+  those two left out of `query` unless `VST3_ARA` is set, since hosts ask every VST3 for them. The
+  interfaces are written as `outputs_in_use`'s are, whose `interface!`, `guid` and `object` they
+  now share. mxm-xtask's `moduleinfo.json`, read from the factory, lists the class with its
+  category.
+- Tests: `mxm_ara_tests` in `src/wrapper/clap/wrapper.rs` (the extension and the binding, a plain
+  plugin offering none), and `tests/ara.rs` (an ARA plugin and a plain one exported through both
+  macros, read as a host reads them).
 
 ## Latency told only inside `activate` — a fix (2026-11-23)
 
