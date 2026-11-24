@@ -851,9 +851,17 @@ thread, outside `activate`. clap-validator refuses that ("Must only be called wi
 'clap_plugin::activate'"); it showed in mxm-fx-pitch, whose *Mode* is a new latency, when the
 validator's parameter tests set *Mode* and deactivated it before the change reached the main thread.
 **The change is now always remembered (`latency_changed`) and told by the next `activate`**, an
-active plugin asking for its restart as before. `MXM PATCH (latency outside activate)` in
-`src/wrapper/clap/wrapper.rs`. VST3 is unchanged: its `restartComponent(kLatencyChanged)` is
-VST3's own way.
+active plugin asking for its restart as before. **The latency a plugin sets while activating is
+told inside that `activate`** (`set_latency_in_activate`, from the activation context, which knows
+it lives there), and only if it differs from one the host has read (`host_read_latency`): a first
+activation's the host reads after it, and Bitwig logs a `changed` there as an error. Upstream sent
+it down the change path, which, the plugin already marked active, asked for a restart from inside
+its own first `activate`. Bitwig 6 holds that restart pending and
+then ignores every later request (2026-11-24, mxm-fx-pitch's *Mode* in Bitwig 6.0.11: never
+restarted, its compensation stuck at the first latency; newDAWn's clack-based latency fixture
+restarted at once). A state load's reactivation is outside `activate` and still asks for a
+restart. `MXM PATCH (latency outside activate)` in `src/wrapper/clap/wrapper.rs` and
+`context.rs`. VST3 is unchanged: its `restartComponent(kLatencyChanged)` is VST3's own way.
 
 ## Outputs in use — a capability, not a fix
 

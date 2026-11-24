@@ -286,6 +286,8 @@ pub struct Wrapper<P: ClapPlugin> {
     /// [`ProcessContext`](nice_plug_core::context::process::ProcessContext). Uses the latency
     /// extension.
     pub current_latency: AtomicU32,
+    /// The host has read the latency (`clap_plugin_latency::get`): a new one is news to it.
+    host_read_latency: AtomicBool,
     /// A data structure that helps manage and create buffers for all of the plugin's inputs and
     /// outputs based on channel pointers provided by the host.
     buffer_manager: AtomicRefCell<BufferManager>,
@@ -941,6 +943,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             host_tail_changed: AtomicCell::new(None),
             latency_changed: AtomicBool::new(false),
             current_latency: AtomicU32::new(0),
+            host_read_latency: AtomicBool::new(false),
             // This is initialized just before calling `Plugin::activate()` so that during the
             // process call buffers can be initialized without any allocations
             buffer_manager: AtomicRefCell::new(BufferManager::for_audio_io_layout(
@@ -1188,11 +1191,13 @@ impl<P: ClapPlugin> Wrapper<P> {
     /// # Note
     ///
     /// The lock on the plugin must be dropped before this object is dropped to avoid deadlocks
-    /// caused by reentrant function calls.
-    fn make_activate_context(&self) -> WrapperActivateContext<'_, P> {
+    /// caused by reentrant function calls. `in_activate`: made, and dropped, inside
+    /// `clap_plugin::activate`.
+    fn make_activate_context(&self, in_activate: bool) -> WrapperActivateContext<'_, P> {
         WrapperActivateContext {
             wrapper: self,
             pending_requests: Default::default(),
+            in_activate,
         }
     }
 
@@ -2022,6 +2027,25 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
+    /// The latency the plugin set while activating, told the host at once if it changed from one
+    /// the host has read: called from inside `clap_plugin::activate`, where CLAP lets
+    /// `clap_host_latency::changed` be called. A host that has read none reads it after `activate`
+    /// (Bitwig logs a `changed` in a first activation as an error).
+    ///
+    /// MXM PATCH (latency outside activate): never through [`Self::set_latency_samples`], whose
+    /// change would ask an already activated plugin's host for a restart from inside `activate`.
+    /// Bitwig 6 holds such a restart pending and then ignores every later one (2026-11-24): an
+    /// active plugin's latency change went unheard there until the plugin was loaded again.
+    pub fn set_latency_in_activate(&self, samples: u32) {
+        let old_latency = self.current_latency.swap(samples, Ordering::SeqCst);
+        if old_latency != samples
+            && self.host_read_latency.load(Ordering::SeqCst)
+            && let Some(host_latency) = &*self.host_latency.borrow()
+        {
+            unsafe_clap_call! { host_latency=>changed(&*self.host_callback) };
+        }
+    }
+
     pub fn set_latency_samples(&self, samples: u32) {
         // Only make a callback if it's actually needed
         // XXX: For CLAP we could move this handling to the Plugin struct, but it may be worthwhile
@@ -2146,7 +2170,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         // One activation context for the transaction, made before the lock and dropped after it,
         // as `make_activate_context()` asks: dropping it may report a latency change, whose
         // restart a host may answer at once by taking the lock (VST3 review, 2026-10-29).
-        let mut activate_context = self.make_activate_context();
+        let mut activate_context = self.make_activate_context(false);
         self.state_transactions.fetch_add(1, Ordering::SeqCst);
         let Some(mut plugin) = self.lock_plugin_for_state_transaction() else {
             self.state_transactions.fetch_add(1, Ordering::SeqCst);
@@ -2374,7 +2398,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             unsafe_clap_call! { host_latency=>changed(&*wrapper.host_callback) };
         }
 
-        let mut activate_context = wrapper.make_activate_context();
+        let mut activate_context = wrapper.make_activate_context(true);
 
         // In the case a host misbehaves and tries to activate the plugin without waiting for the
         // `process` method to finish, manually wait for that method to finish.
@@ -3916,6 +3940,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!(0, plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
+        wrapper.host_read_latency.store(true, Ordering::SeqCst);
         wrapper.current_latency.load(Ordering::SeqCst)
     }
 

@@ -32,6 +32,9 @@ use crate::wrapper::util::{clamp_output_event_timing, strlcpy};
 pub(crate) struct WrapperActivateContext<'a, P: ClapPlugin> {
     pub(super) wrapper: &'a Wrapper<P>,
     pub(super) pending_requests: PendingActivateContextRequests,
+    /// Made by `clap_plugin::activate` and dropped inside it, where the host may be told a new
+    /// latency at once; else a state load's reactivation, whose new latency asks for a restart.
+    pub(super) in_activate: bool,
 }
 
 /// Any requests that should be sent out when the [`WrapperActivateContext`] is dropped. See that
@@ -80,7 +83,11 @@ pub(crate) struct RemoteControlPages<'a> {
 impl<P: ClapPlugin> Drop for WrapperActivateContext<'_, P> {
     fn drop(&mut self) {
         if let Some(samples) = self.pending_requests.latency_changed.take() {
-            self.wrapper.set_latency_samples(samples)
+            if self.in_activate {
+                self.wrapper.set_latency_in_activate(samples)
+            } else {
+                self.wrapper.set_latency_samples(samples)
+            }
         }
     }
 }
